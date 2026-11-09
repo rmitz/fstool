@@ -390,7 +390,7 @@ pub struct LibConvert<'a> {
     pub checksum: Option<&'a str>,
     pub layout: Option<&'a str>,
     #[cfg(feature = "dmg-write")]
-    pub threads: Option<usize>,
+    pub compress_threads: Option<usize>,
     pub drop_resources: bool,
     pub remove_signature: bool,
     pub discard_legacy_fork: bool,
@@ -436,7 +436,7 @@ pub fn lib_convert(a: LibConvert<'_>) -> fstool::Result<()> {
             o.target = Some(fstool::block::imageops::ImageKind::Udif);
         }
         o.udif.level = a.level;
-        o.udif.threads = a.threads.unwrap_or(1);
+        o.udif.threads = a.compress_threads.unwrap_or(1);
         if let Some(c) = a.checksum {
             o.udif.checksum = match c.to_ascii_lowercase().as_str() {
                 "crc32" | "crc" => UdifChecksum::Crc32,

@@ -112,6 +112,9 @@ pub const MAX_WRITE_CHUNK_SECTORS: u32 = 16_384;
 
 /// Most worker threads [`UdifWriteOptions::threads`] accepts.
 pub const MAX_WRITE_THREADS: usize = 16;
+
+/// Read-ahead block used when streaming a source into the UDIF writer.
+const READ_AHEAD: usize = 8 << 20;
 /// Longest zero / ignore run one descriptor carries. Kept well inside the
 /// reader's [`MAX_CHUNK_SECTORS`] so a writer-produced image always
 /// re-opens.
@@ -766,7 +769,7 @@ impl Parallel {
             next_sender: 0,
             rx,
             workers,
-            window: (threads * 2).max(2),
+            window: (threads * 4).max(2),
             in_flight: 0,
             next_send: 0,
             next_write: 0,
@@ -1642,7 +1645,7 @@ pub fn write_udif<W: Write + Seek>(
         }
     }
     let mut w = UdifWriter::new(out, opts)?;
-    let mut buf = vec![0u8; opts.chunk_sectors as usize * SECTOR];
+    let mut buf = vec![0u8; (opts.chunk_sectors as usize * SECTOR).max(READ_AHEAD)];
     let mut off = 0u64;
     while off < total {
         let n = buf.len().min((total - off) as usize);
@@ -1665,7 +1668,7 @@ pub fn write_udif_from_reader<R: Read, W: Write + Seek>(
 ) -> Result<(W, UdifSummary)> {
     check_length(len)?;
     let mut w = UdifWriter::new(out, opts)?;
-    let mut buf = vec![0u8; opts.chunk_sectors as usize * SECTOR];
+    let mut buf = vec![0u8; (opts.chunk_sectors as usize * SECTOR).max(READ_AHEAD)];
     let mut off = 0u64;
     while off < len {
         let n = buf.len().min((len - off) as usize);

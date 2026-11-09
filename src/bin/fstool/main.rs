@@ -458,7 +458,7 @@ enum Command {
         /// to a sequential write.
         #[cfg(feature = "dmg-write")]
         #[arg(long, value_name = "N")]
-        dmg_threads: Option<usize>,
+        dmg_compress_threads: Option<usize>,
         /// Discard the source .dmg's resources (licence agreement, …)
         /// instead of carrying them — required when DST cannot hold them.
         #[cfg(feature = "dmg")]
@@ -1174,7 +1174,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
             #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
             dmg_encrypt_chunk_size,
             #[cfg(feature = "dmg-write")]
-            dmg_threads,
+            dmg_compress_threads,
             #[cfg(feature = "dmg")]
             drop_resources,
             #[cfg(feature = "dmg")]
@@ -1290,7 +1290,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
                         #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
                         dmg_encryption: dmg_encrypt,
                         #[cfg(feature = "dmg-write")]
-                        threads: dmg_threads,
+                        compress_threads: dmg_compress_threads,
                         drop_resources,
                         remove_signature,
                         discard_legacy_fork: discard_legacy_resource_fork,

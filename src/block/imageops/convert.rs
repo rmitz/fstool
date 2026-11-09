@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+use std::io::Write as _;
+
 use super::{COPY_CHUNK, open_source, same_file, write_beside};
 use crate::Result;
 use crate::block::BlockDevice;
@@ -157,6 +160,72 @@ impl std::fmt::Debug for DmgEncryption {
             .field("passphrase", &"<redacted>")
             .field("chunk_size", &self.chunk_size)
             .finish()
+    }
+}
+
+/// One message to the encrypted writer thread: a piece of the UDIF byte
+/// stream, or end-of-stream.
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+enum SinkMsg {
+    Data(Vec<u8>),
+    End,
+}
+
+/// A `Write + Seek` sink that hands the UDIF byte stream to the writer
+/// thread. The writer owns the encryption sink and the output file, so
+/// encryption and disk writes overlap the main thread's read/scan/compress
+/// pipeline.
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+struct ChannelSink {
+    tx: std::sync::mpsc::SyncSender<SinkMsg>,
+    pos: u64,
+}
+
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+impl std::io::Write for ChannelSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tx.send(SinkMsg::Data(buf.to_vec())).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "dmg: encrypted writer stopped",
+            )
+        })?;
+        self.pos += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+impl std::io::Seek for ChannelSink {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match pos {
+            std::io::SeekFrom::Current(0) => Ok(self.pos),
+            std::io::SeekFrom::Start(n) if n == self.pos => Ok(self.pos),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "dmg: channel sink is forward-only",
+            )),
+        }
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.pos)
+    }
+}
+
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+impl ChannelSink {
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.tx.send(SinkMsg::End).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "dmg: encrypted writer stopped",
+            )
+        })
     }
 }
 
@@ -395,21 +464,61 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                     use crate::block::dmg::encrypted::{
                         CreateOptions, EncryptedDmgSink, OsRandom, Protector,
                     };
+                    use std::sync::mpsc;
                     write_beside(dst, |tmp| {
                         let f = std::fs::File::create(tmp)?;
                         let mut copts = CreateOptions::default();
                         copts.chunk_size = enc.chunk_size;
-                        let sink = EncryptedDmgSink::new(
-                            f,
-                            vec![Protector::Passphrase(&enc.passphrase)],
-                            enc.cipher,
-                            copts,
-                            &mut OsRandom,
-                        )?;
-                        let (sink, summary) = write_udif(dev.as_mut(), sink, &wo)?;
-                        let (f, _created) = sink.finish(&mut OsRandom)?;
-                        f.sync_all()?;
-                        Ok(summary)
+                        let (tx, rx) = mpsc::sync_channel::<SinkMsg>(64);
+                        std::thread::scope(
+                            |scope| -> crate::Result<crate::block::dmg::UdifSummary> {
+                                let writer = std::thread::Builder::new()
+                                    .name("fstool-enc".into())
+                                    .spawn_scoped(scope, move || -> crate::Result<()> {
+                                        let mut sink = EncryptedDmgSink::new(
+                                            f,
+                                            vec![Protector::Passphrase(&enc.passphrase)],
+                                            enc.cipher,
+                                            copts,
+                                            &mut OsRandom,
+                                        )?;
+                                        let mut ended = false;
+                                        for msg in rx {
+                                            match msg {
+                                                SinkMsg::Data(buf) => sink.write_all(&buf)?,
+                                                SinkMsg::End => {
+                                                    ended = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if !ended {
+                                            // The main thread failed and dropped
+                                            // its sender; leave the partial file
+                                            // for `write_beside` to remove.
+                                            return Ok(());
+                                        }
+                                        let (file, _created) = sink.finish(&mut OsRandom)?;
+                                        file.sync_all()?;
+                                        Ok(())
+                                    })
+                                    .map_err(|e| {
+                                        crate::Error::Io(std::io::Error::other(format!(
+                                            "dmg: cannot start encrypted writer: {e}"
+                                        )))
+                                    })?;
+                                let sink = ChannelSink { tx, pos: 0 };
+                                let (mut sink, summary) = write_udif(dev.as_mut(), sink, &wo)?;
+                                sink.finish()?;
+                                drop(sink);
+                                writer.join().map_err(|_| {
+                                    crate::Error::Io(std::io::Error::other(
+                                        "dmg: encrypted writer thread panicked",
+                                    ))
+                                })??;
+                                Ok(summary)
+                            },
+                        )
                     })?
                 } else {
                     write_beside(dst, |tmp| {
