@@ -1248,6 +1248,9 @@ pub fn remove_key_record_with<F: Read + Write + Seek + ?Sized>(
     Ok(())
 }
 
+/// Ciphertext is accumulated into this many bytes before one `write`.
+const SINK_WRITE_BATCH: usize = 1 << 20;
+
 /// A [`Write`] + [`Seek`] sink that encrypts a payload into an
 /// `encrcdsa` v2 image as it is written.
 ///
@@ -1275,6 +1278,8 @@ pub struct EncryptedDmgSink<'a, W: Write + Seek> {
     buf_len: usize,
     chunk_index: u64,
     payload_len: u64,
+    /// Ciphertext waiting to be written in one large `write`.
+    out_buf: Vec<u8>,
 }
 
 impl<'a, W: Write + Seek> EncryptedDmgSink<'a, W> {
@@ -1315,6 +1320,7 @@ impl<'a, W: Write + Seek> EncryptedDmgSink<'a, W> {
             buf_len: 0,
             chunk_index: 0,
             payload_len: 0,
+            out_buf: Vec::with_capacity(SINK_WRITE_BATCH),
             opts,
         })
     }
@@ -1330,7 +1336,11 @@ impl<'a, W: Write + Seek> EncryptedDmgSink<'a, W> {
         })?;
         let iv = chunk_iv(self.keys.hmac_key(), idx);
         aes_cbc_encrypt(self.keys.aes_key(), &iv, &mut self.buf.0)?;
-        self.out.write_all(&self.buf.0)?;
+        if self.out_buf.len() + self.buf.0.len() > SINK_WRITE_BATCH {
+            self.out.write_all(&self.out_buf)?;
+            self.out_buf.clear();
+        }
+        self.out_buf.extend_from_slice(&self.buf.0);
         self.buf.0.fill(0);
         self.buf_len = 0;
         self.chunk_index += 1;
@@ -1343,6 +1353,10 @@ impl<'a, W: Write + Seek> EncryptedDmgSink<'a, W> {
         if self.buf_len > 0 {
             self.buf.0[self.buf_len..].fill(0);
             self.write_chunk()?;
+        }
+        if !self.out_buf.is_empty() {
+            self.out.write_all(&self.out_buf)?;
+            self.out_buf.clear();
         }
         let plan = Plan::new(
             self.payload_len,
@@ -1389,6 +1403,10 @@ impl<W: Write + Seek> Write for EncryptedDmgSink<'_, W> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if !self.out_buf.is_empty() {
+            self.out.write_all(&self.out_buf)?;
+            self.out_buf.clear();
+        }
         self.out.flush()
     }
 }
@@ -2199,5 +2217,52 @@ mod tests {
             assert_eq!(decrypt_with_key(&out, &key).unwrap(), payload);
             assert_eq!(decrypt(&out, "pw").unwrap(), payload);
         }
+    }
+
+    #[test]
+    fn streaming_sink_batches_writes() {
+        use std::io::{Cursor, Seek, SeekFrom, Write};
+
+        struct Counting {
+            inner: Cursor<Vec<u8>>,
+            writes: usize,
+        }
+
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.inner.write(buf)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+
+        impl Seek for Counting {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(pos)
+            }
+        }
+
+        let out = Counting {
+            inner: Cursor::new(Vec::new()),
+            writes: 0,
+        };
+        let mut sink = EncryptedDmgSink::new(
+            out,
+            vec![Protector::Passphrase("pw")],
+            ContentCipher::Aes256,
+            opts(10),
+            &mut test_rng(1),
+        )
+        .unwrap();
+        let data = pattern(4 * 1024 * 1024);
+        sink.write_all(&data).unwrap();
+        let (out, created) = sink.finish(&mut test_rng(2)).unwrap();
+        assert_eq!(created.payload_len, data.len() as u64);
+        // 4 MiB is 8192 encrypted 512-byte chunks. Batching at 1 MiB must
+        // turn that into a handful of writes, not thousands.
+        assert!(out.writes < 16, "writes = {}", out.writes);
     }
 }

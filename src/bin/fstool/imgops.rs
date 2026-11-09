@@ -404,6 +404,7 @@ pub struct LibConvert<'a> {
 pub struct DmgEncryption<'a> {
     pub passphrase: &'a str,
     pub cipher: &'a str,
+    pub chunk_size: Option<u32>,
 }
 
 /// `convert` through `fstool::block::imageops::convert_image`: any UDIF
@@ -483,10 +484,11 @@ pub fn lib_convert(a: LibConvert<'_>) -> fstool::Result<()> {
                 )));
             }
         };
-        o.dmg_encryption = Some(fstool::block::imageops::DmgEncryption::new(
-            cipher,
-            enc.passphrase,
-        ));
+        let mut dmg_enc = fstool::block::imageops::DmgEncryption::new(cipher, enc.passphrase);
+        if let Some(chunk_size) = enc.chunk_size {
+            dmg_enc = dmg_enc.with_chunk_size(chunk_size);
+        }
+        o.dmg_encryption = Some(dmg_enc);
         // `--dmg-encryption` always means a UDIF, whatever the name says.
         o.target = Some(fstool::block::imageops::ImageKind::Udif);
     }

@@ -122,6 +122,9 @@ pub struct DmgEncryption {
     pub cipher: crate::block::dmg::encrypted::ContentCipher,
     /// Passphrase protecting the content key.
     pub passphrase: String,
+    /// `encrcdsa` payload chunk size. Default 512, as `hdiutil`; larger
+    /// chunks amortize the per-chunk IV/AES setup.
+    pub chunk_size: u32,
 }
 
 #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
@@ -134,7 +137,15 @@ impl DmgEncryption {
         Self {
             cipher,
             passphrase: passphrase.into(),
+            chunk_size: crate::block::dmg::encrypted::DEFAULT_CHUNK_SIZE,
         }
+    }
+
+    /// Set the `encrcdsa` payload chunk size (a multiple of 16, at most
+    /// [`MAX_CHUNK_SIZE`](crate::block::dmg::encrypted::MAX_CHUNK_SIZE)).
+    pub fn with_chunk_size(mut self, chunk_size: u32) -> Self {
+        self.chunk_size = chunk_size;
+        self
     }
 }
 
@@ -144,6 +155,7 @@ impl std::fmt::Debug for DmgEncryption {
         f.debug_struct("DmgEncryption")
             .field("cipher", &self.cipher)
             .field("passphrase", &"<redacted>")
+            .field("chunk_size", &self.chunk_size)
             .finish()
     }
 }
@@ -385,11 +397,13 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                     };
                     write_beside(dst, |tmp| {
                         let f = std::fs::File::create(tmp)?;
+                        let mut copts = CreateOptions::default();
+                        copts.chunk_size = enc.chunk_size;
                         let sink = EncryptedDmgSink::new(
                             f,
                             vec![Protector::Passphrase(&enc.passphrase)],
                             enc.cipher,
-                            CreateOptions::default(),
+                            copts,
                             &mut OsRandom,
                         )?;
                         let (sink, summary) = write_udif(dev.as_mut(), sink, &wo)?;

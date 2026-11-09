@@ -446,6 +446,12 @@ enum Command {
         #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
         #[arg(long, value_name = "CIPHER")]
         dmg_encryption: Option<String>,
+        /// `encrcdsa` payload chunk size in bytes (default 512, as
+        /// hdiutil; a multiple of 16, at most 1 MiB). Larger chunks
+        /// amortize the per-chunk IV/AES setup.
+        #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+        #[arg(long, value_name = "BYTES")]
+        dmg_encrypt_chunk_size: Option<u32>,
         /// Compression worker threads for a UDIF destination: `0` uses
         /// all available CPUs, `1` is sequential (the default). Only
         /// compressed formats use the pool; the output is byte-identical
@@ -1165,6 +1171,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
             dmg_layout,
             #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
             dmg_encryption,
+            #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+            dmg_encrypt_chunk_size,
             #[cfg(feature = "dmg-write")]
             dmg_threads,
             #[cfg(feature = "dmg")]
@@ -1254,6 +1262,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
                             Some(imgops::DmgEncryption {
                                 passphrase: pw,
                                 cipher,
+                                chunk_size: dmg_encrypt_chunk_size,
                             })
                         }
                         None => None,
