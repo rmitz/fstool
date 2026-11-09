@@ -73,7 +73,10 @@
 //! [`crate::Error::Unsupported`] naming the cause, before anything is
 //! written.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek, Write};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
 
 pub use super::layout::udif_partition_map;
 use super::mish::{CHUNK_LEN, ChunkType, MISH_HEADER_LEN, MISH_MAGIC};
@@ -106,6 +109,9 @@ const DEFAULT_CHUNK_SECTORS: u32 = 2048;
 /// writer's per-chunk buffers (8 MiB of plaintext) while staying far below
 /// the reader's own cap.
 pub const MAX_WRITE_CHUNK_SECTORS: u32 = 16_384;
+
+/// Most worker threads [`UdifWriteOptions::threads`] accepts.
+pub const MAX_WRITE_THREADS: usize = 16;
 /// Longest zero / ignore run one descriptor carries. Kept well inside the
 /// reader's [`MAX_CHUNK_SECTORS`] so a writer-produced image always
 /// re-opens.
@@ -223,6 +229,14 @@ impl UdifFormat {
     /// stores every sector.
     fn elides_zeros(self) -> bool {
         self != Self::Ufbi
+    }
+
+    /// Whether the writer runs a compression codec for this format.
+    fn compresses(self) -> bool {
+        matches!(
+            self,
+            Self::Udco | Self::Udzo | Self::Udbz | Self::Ulmo | Self::Ulfo
+        )
     }
 
     /// The mish `buffers_needed` field of an entry holding compressed
@@ -358,6 +372,11 @@ pub struct UdifWriteOptions {
     /// Maximum sectors per data chunk, `1..=`[`MAX_WRITE_CHUNK_SECTORS`].
     /// Default 2048 (1 MiB), as `hdiutil`. Sets the writer's buffer size.
     pub chunk_sectors: u32,
+    /// Compression worker threads for a compressed format. `1` (the
+    /// default) compresses on the caller's thread; `0` uses the host's
+    /// available parallelism; larger values start a bounded worker pool.
+    /// The output is byte-identical to the sequential writer.
+    pub threads: usize,
     /// How all-zero sector runs are recorded. Default
     /// [`ZeroRunEncoding::ZeroFill`].
     pub zero_runs: ZeroRunEncoding,
@@ -388,6 +407,7 @@ impl Default for UdifWriteOptions {
             format: UdifFormat::default(),
             level: None,
             chunk_sectors: DEFAULT_CHUNK_SECTORS,
+            threads: 1,
             zero_runs: ZeroRunEncoding::default(),
             checksum: UdifChecksum::default(),
             partition_name: "whole disk (Apple_HFS : 0)".into(),
@@ -421,6 +441,12 @@ impl UdifWriteOptions {
             return Err(crate::Error::InvalidArgument(format!(
                 "dmg: chunk_sectors must be 1..={MAX_WRITE_CHUNK_SECTORS} (got {})",
                 self.chunk_sectors
+            )));
+        }
+        if self.threads > MAX_WRITE_THREADS {
+            return Err(crate::Error::InvalidArgument(format!(
+                "dmg: threads must be 0..={MAX_WRITE_THREADS} (got {})",
+                self.threads
             )));
         }
         match (self.level, self.format.level_range()) {
@@ -657,6 +683,123 @@ struct Blkx {
     sum: Sum,
 }
 
+/// One chunk handed to a compression worker.
+struct ChunkJob {
+    index: u64,
+    plain: Vec<u8>,
+}
+
+/// A worker's result for one chunk.
+struct ChunkDone {
+    index: u64,
+    /// `None` for formats that store raw (UDRO/UFBI).
+    encoded: Option<(ChunkType, Vec<u8>)>,
+    /// The original plaintext, returned for buffer reuse.
+    plain: Vec<u8>,
+}
+
+/// Metadata kept by the main thread for each dispatched chunk.
+struct ChunkMeta {
+    sector: u64,
+    count: u64,
+}
+
+/// A bounded compression worker pool. Only `encode_chunk` runs in the
+/// workers; sector scanning, zero-run handling, checksums, ordering and
+/// output all stay on the main thread, so parallel output is byte-identical
+/// to the sequential writer.
+struct Parallel {
+    senders: Vec<Sender<ChunkJob>>,
+    next_sender: usize,
+    rx: Receiver<crate::Result<ChunkDone>>,
+    workers: Vec<JoinHandle<()>>,
+    /// Chunks dispatched but not yet written.
+    window: usize,
+    in_flight: usize,
+    next_send: u64,
+    next_write: u64,
+    ready: BTreeMap<u64, ChunkDone>,
+    meta: VecDeque<ChunkMeta>,
+    free: Vec<Vec<u8>>,
+    chunk_bytes: usize,
+}
+
+impl Parallel {
+    fn new(
+        format: UdifFormat,
+        level: Option<u8>,
+        threads: usize,
+        chunk_bytes: usize,
+    ) -> Result<Self> {
+        let threads = threads.clamp(1, MAX_WRITE_THREADS);
+        let (tx, rx) = mpsc::channel();
+        let mut senders = Vec::with_capacity(threads);
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let (job_tx, job_rx) = mpsc::channel::<ChunkJob>();
+            let tx = tx.clone();
+            let worker = std::thread::Builder::new()
+                .name("fstool-udif".into())
+                .spawn(move || {
+                    while let Ok(job) = job_rx.recv() {
+                        let result =
+                            encode_chunk(format, level, &job.plain).map(|encoded| ChunkDone {
+                                index: job.index,
+                                encoded,
+                                plain: job.plain,
+                            });
+                        if tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .map_err(|e| {
+                    crate::Error::Io(std::io::Error::other(format!(
+                        "dmg: cannot start compression worker: {e}"
+                    )))
+                })?;
+            senders.push(job_tx);
+            workers.push(worker);
+        }
+        Ok(Self {
+            senders,
+            next_sender: 0,
+            rx,
+            workers,
+            window: (threads * 2).max(2),
+            in_flight: 0,
+            next_send: 0,
+            next_write: 0,
+            ready: BTreeMap::new(),
+            meta: VecDeque::new(),
+            free: Vec::new(),
+            chunk_bytes,
+        })
+    }
+
+    fn take_buffer(&mut self) -> Vec<u8> {
+        self.free
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.chunk_bytes))
+    }
+
+    fn recycle(&mut self, mut buf: Vec<u8>) {
+        if buf.capacity() >= self.chunk_bytes {
+            buf.clear();
+            self.free.push(buf);
+        }
+    }
+}
+
+impl Drop for Parallel {
+    fn drop(&mut self) {
+        self.senders.clear();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Streaming UDIF encoder over a caller-owned sink.
 ///
 /// Feed sectors with [`write_sectors`](Self::write_sectors), then call
@@ -700,6 +843,8 @@ pub struct UdifWriter<W: Write + Seek> {
     part_sum: Digest,
     fork_sum: Digest,
     poisoned: bool,
+    /// Worker pool for compressed chunks; `None` = sequential.
+    parallel: Option<Parallel>,
 }
 
 impl<W: Write + Seek> std::fmt::Debug for UdifWriter<W> {
@@ -770,6 +915,21 @@ impl<W: Write + Seek> UdifWriter<W> {
         } else {
             opts.chunk_sectors as usize * SECTOR
         };
+        let threads = if opts.threads == 0 {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        } else {
+            opts.threads
+        };
+        let parallel = if threads > 1 && opts.format.compresses() {
+            Some(Parallel::new(
+                opts.format,
+                opts.level,
+                threads,
+                chunk_bytes,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             out,
             opts: opts.clone(),
@@ -789,6 +949,7 @@ impl<W: Write + Seek> UdifWriter<W> {
             part_sum: Digest::new(checksum),
             fork_sum: Digest::new(checksum),
             poisoned: false,
+            parallel,
         })
     }
 
@@ -873,7 +1034,7 @@ impl<W: Write + Seek> UdifWriter<W> {
                 match &mut self.zero_run {
                     Some((_, n)) if *n < MAX_ZERO_RUN_SECTORS => *n += 1,
                     _ => {
-                        self.close_zero_run();
+                        self.close_zero_run()?;
                         self.zero_run = Some((lba, 1));
                     }
                 }
@@ -881,7 +1042,7 @@ impl<W: Write + Seek> UdifWriter<W> {
                     self.part_sum.update(sector);
                 }
             } else {
-                self.close_zero_run();
+                self.close_zero_run()?;
                 if self.pending.is_empty() {
                     self.pending_start = lba;
                 }
@@ -908,8 +1069,13 @@ impl<W: Write + Seek> UdifWriter<W> {
         }
     }
 
-    fn close_zero_run(&mut self) {
+    fn close_zero_run(&mut self) -> Result<()> {
         if let Some((sector, count)) = self.zero_run.take() {
+            // A zero entry's offset is the data fork's current end, so
+            // any compressed chunks before it must be written first.
+            if self.parallel.is_some() {
+                self.drain_all()?;
+            }
             self.entries.push(Entry {
                 kind: self.zero_kind(),
                 sector,
@@ -918,12 +1084,16 @@ impl<W: Write + Seek> UdifWriter<W> {
                 length: 0,
             });
         }
+        Ok(())
     }
 
     /// Encode and write the accumulated data run as one chunk.
     fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
+        }
+        if self.parallel.is_some() {
+            return self.flush_pending_parallel();
         }
         let count = (self.pending.len() / SECTOR) as u64;
         let encoded = encode_chunk(self.opts.format, self.opts.level, &self.pending)?;
@@ -946,10 +1116,121 @@ impl<W: Write + Seek> UdifWriter<W> {
         Ok(())
     }
 
+    /// Dispatch the accumulated run to a worker. The result is written,
+    /// in dispatch order, by `drain_ready`.
+    fn flush_pending_parallel(&mut self) -> Result<()> {
+        let count = (self.pending.len() / SECTOR) as u64;
+        let plain = std::mem::take(&mut self.pending);
+        let mut p = self.parallel.take().expect("parallel writer state");
+        let index = p.next_send;
+        p.next_send += 1;
+        p.in_flight += 1;
+        p.meta.push_back(ChunkMeta {
+            sector: self.pending_start,
+            count,
+        });
+        let sender = p.senders[p.next_sender].clone();
+        p.next_sender = (p.next_sender + 1) % p.senders.len();
+        let sent = sender.send(ChunkJob { index, plain });
+        self.pending = p.take_buffer();
+        if sent.is_err() {
+            self.parallel = Some(p);
+            return Err(crate::Error::Io(std::io::Error::other(
+                "dmg: compression worker stopped",
+            )));
+        }
+        let r = self.drain_ready(&mut p, false);
+        self.parallel = Some(p);
+        r
+    }
+
+    /// Wait for every dispatched chunk and write it. Used at zero-run and
+    /// region boundaries, where the data fork's current end is recorded.
+    fn drain_all(&mut self) -> Result<()> {
+        let Some(mut p) = self.parallel.take() else {
+            return Ok(());
+        };
+        let r = self.drain_ready(&mut p, true);
+        self.parallel = Some(p);
+        r
+    }
+
+    /// Receive worker results and write every contiguous one. With
+    /// `all`, block until nothing is in flight; otherwise only keep the
+    /// in-flight window bounded.
+    fn drain_ready(&mut self, p: &mut Parallel, all: bool) -> Result<()> {
+        loop {
+            match p.rx.try_recv() {
+                Ok(res) => {
+                    let done = res?;
+                    p.ready.insert(done.index, done);
+                    self.emit_ready(p)?;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if p.in_flight > 0 {
+                        return Err(crate::Error::Io(std::io::Error::other(
+                            "dmg: compression worker stopped",
+                        )));
+                    }
+                    break;
+                }
+            }
+        }
+        while p.in_flight > 0 && (all || p.in_flight >= p.window) {
+            let res = p.rx.recv().map_err(|_| {
+                crate::Error::Io(std::io::Error::other("dmg: compression worker stopped"))
+            })?;
+            let done = res?;
+            p.ready.insert(done.index, done);
+            self.emit_ready(p)?;
+        }
+        Ok(())
+    }
+
+    /// Write completed chunks in dispatch order, updating the data-fork
+    /// checksum and the mish descriptors exactly as the sequential path.
+    fn emit_ready(&mut self, p: &mut Parallel) -> Result<()> {
+        while let Some(done) = p.ready.remove(&p.next_write) {
+            let meta = p.meta.pop_front().ok_or_else(|| {
+                crate::Error::InvalidArgument("dmg: chunk metadata underflow".into())
+            })?;
+            let ChunkDone { encoded, plain, .. } = done;
+            let (kind, payload, recycle) = match encoded {
+                Some((kind, bytes)) if bytes.len() < plain.len() => (kind, bytes, Some(plain)),
+                _ => (ChunkType::Raw, plain, None),
+            };
+            self.out.write_all(&payload)?;
+            self.fork_sum.update(&payload);
+            let length = payload.len() as u64;
+            self.entries.push(Entry {
+                kind,
+                sector: meta.sector,
+                count: meta.count,
+                offset: self.fork_len,
+                length,
+            });
+            self.fork_len += length;
+            p.next_write += 1;
+            p.in_flight -= 1;
+            if let Some(buf) = recycle {
+                p.recycle(buf);
+            }
+            if kind == ChunkType::Raw {
+                p.recycle(payload);
+            }
+        }
+        Ok(())
+    }
+
     /// Finish the current region's mish table and move to the next.
     fn close_region(&mut self) -> Result<()> {
         self.flush_pending()?;
-        self.close_zero_run();
+        self.close_zero_run()?;
+        // `close_zero_run` drains only when it actually closes a run; a
+        // region that ends on a compressed chunk still needs the pool
+        // empty before its mish table is built.
+        self.drain_all()?;
         if self.entries.len() >= u32::MAX as usize {
             return Err(crate::Error::Unsupported(
                 "dmg: too many chunks for one mish table; raise chunk_sectors".into(),
@@ -2118,5 +2399,59 @@ mod tests {
         assert!(s.partition_crc32.is_some());
         let img = cur.into_inner();
         assert_eq!(blkx_entries(&img)[0].0, "whole disk (Apple_HFS : 0)");
+    }
+
+    #[test]
+    fn parallel_udzo_matches_sequential() {
+        let disk = sample_disk();
+        let mut one = opts(UdifFormat::Udzo);
+        one.threads = 1;
+        let mut many = one.clone();
+        many.threads = 4;
+        let (a, sa) = roundtrip(&one, &disk);
+        let (b, sb) = roundtrip(&many, &disk);
+        assert!(a == b, "parallel UDZO output differs from sequential");
+        assert_eq!(sa.chunk_count, sb.chunk_count);
+        assert_eq!(sa.data_fork_crc32, sb.data_fork_crc32);
+        assert_eq!(sa.master_crc32, sb.master_crc32);
+    }
+
+    #[test]
+    fn parallel_udzo_matches_sequential_across_regions() {
+        // `Gpt::build` generates fresh GUIDs, so build the source once and
+        // feed both writers identical bytes.
+        let mut src = gpt_disk();
+        let mut bytes = vec![0u8; src.total_size() as usize];
+        src.read_at(0, &mut bytes).unwrap();
+        let mut d1 = crate::block::MemoryBackend::new(bytes.len() as u64);
+        d1.write_at(0, &bytes).unwrap();
+        let mut d2 = crate::block::MemoryBackend::new(bytes.len() as u64);
+        d2.write_at(0, &bytes).unwrap();
+
+        let mut one = opts(UdifFormat::Udzo);
+        one.layout = UdifLayout::Auto;
+        one.threads = 1;
+        let mut many = one.clone();
+        many.threads = 4;
+        let (c1, _) = write_udif(&mut d1, Cursor::new(Vec::new()), &one).unwrap();
+        let (c2, _) = write_udif(&mut d2, Cursor::new(Vec::new()), &many).unwrap();
+        assert!(
+            c1.into_inner() == c2.into_inner(),
+            "parallel region output differs"
+        );
+    }
+
+    #[test]
+    fn threads_option_is_checked() {
+        let mut o = opts(UdifFormat::Udzo);
+        o.threads = MAX_WRITE_THREADS + 1;
+        assert!(matches!(
+            o.validate(),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+        o.threads = MAX_WRITE_THREADS;
+        o.validate().unwrap();
+        o.threads = 0;
+        o.validate().unwrap();
     }
 }

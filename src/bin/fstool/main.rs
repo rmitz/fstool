@@ -446,6 +446,13 @@ enum Command {
         #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
         #[arg(long, value_name = "CIPHER")]
         dmg_encryption: Option<String>,
+        /// Compression worker threads for a UDIF destination: `0` uses
+        /// all available CPUs, `1` is sequential (the default). Only
+        /// compressed formats use the pool; the output is byte-identical
+        /// to a sequential write.
+        #[cfg(feature = "dmg-write")]
+        #[arg(long, value_name = "N")]
+        dmg_threads: Option<usize>,
         /// Discard the source .dmg's resources (licence agreement, …)
         /// instead of carrying them — required when DST cannot hold them.
         #[cfg(feature = "dmg")]
@@ -1158,6 +1165,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
             dmg_layout,
             #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
             dmg_encryption,
+            #[cfg(feature = "dmg-write")]
+            dmg_threads,
             #[cfg(feature = "dmg")]
             drop_resources,
             #[cfg(feature = "dmg")]
@@ -1271,6 +1280,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
                         layout: None,
                         #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
                         dmg_encryption: dmg_encrypt,
+                        #[cfg(feature = "dmg-write")]
+                        threads: dmg_threads,
                         drop_resources,
                         remove_signature,
                         discard_legacy_fork: discard_legacy_resource_fork,

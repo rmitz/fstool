@@ -239,7 +239,7 @@ mod host {
             if u32::from_be_bytes(magic) == dmg::KOLY_MAGIC {
                 return Ok(Some(Box::new(dmg::DmgBackend::from_reader(enc, len)?)));
             }
-            return Ok(Some(Box::new(enc)));
+            Ok(Some(Box::new(enc)))
         }
         #[cfg(not(feature = "dmg-encrypted"))]
         {
