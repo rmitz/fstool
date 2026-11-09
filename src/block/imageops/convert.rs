@@ -114,8 +114,42 @@ pub enum ResourcePolicy {
 #[cfg(feature = "dmg")]
 const REGENERATED: [&str; 2] = [crate::block::dmg::BLKX_RESOURCE, "cSum"];
 
+/// `encrcdsa` v2 encryption for a UDIF target.
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+#[derive(Clone)]
+pub struct DmgEncryption {
+    /// Payload cipher.
+    pub cipher: crate::block::dmg::encrypted::ContentCipher,
+    /// Passphrase protecting the content key.
+    pub passphrase: String,
+}
+
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+impl DmgEncryption {
+    /// AES-128 or AES-256, protected by `passphrase`.
+    pub fn new(
+        cipher: crate::block::dmg::encrypted::ContentCipher,
+        passphrase: impl Into<String>,
+    ) -> Self {
+        Self {
+            cipher,
+            passphrase: passphrase.into(),
+        }
+    }
+}
+
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+impl std::fmt::Debug for DmgEncryption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmgEncryption")
+            .field("cipher", &self.cipher)
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Options for [`convert_image`]. Construct with `Default` and assign.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ConvertOptions {
     /// Target kind; `None` takes it from the destination's extension
@@ -127,6 +161,11 @@ pub struct ConvertOptions {
     /// [`UdifLayout::Auto`]: crate::block::dmg::UdifLayout::Auto
     #[cfg(feature = "dmg-write")]
     pub udif: crate::block::dmg::UdifWriteOptions,
+    /// Encrypt a UDIF target with Apple's `encrcdsa` v2 wrapper.
+    /// `None` writes an ordinary `.dmg`. A non-UDIF target with encryption
+    /// requested is rejected before output creation.
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    pub dmg_encryption: Option<DmgEncryption>,
     /// For a UDIF source and UDIF target: reproduce the source's `blkx`
     /// map (names, IDs, block descriptors, free-space regions) instead of
     /// `udif.layout`. Default true.
@@ -144,6 +183,24 @@ pub struct ConvertOptions {
     pub policy: crate::block::dmg::UdifRewritePolicy,
 }
 
+impl std::fmt::Debug for ConvertOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("ConvertOptions");
+        d.field("target", &self.target);
+        #[cfg(feature = "dmg-write")]
+        d.field("udif", &self.udif);
+        #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+        d.field("dmg_encryption", &self.dmg_encryption);
+        d.field("preserve_layout", &self.preserve_layout)
+            .field("resources", &self.resources)
+            .field("sparse_band_size", &self.sparse_band_size)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"));
+        #[cfg(feature = "dmg")]
+        d.field("policy", &self.policy);
+        d.finish()
+    }
+}
+
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
@@ -153,6 +210,8 @@ impl Default for ConvertOptions {
                 layout: crate::block::dmg::UdifLayout::Auto,
                 ..Default::default()
             },
+            #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+            dmg_encryption: None,
             preserve_layout: true,
             resources: ResourcePolicy::Keep,
             sparse_band_size: 0,
@@ -212,6 +271,12 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
     let target = opts
         .target
         .unwrap_or_else(|| ImageKind::from_extension(dst));
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    if opts.dmg_encryption.is_some() && target != ImageKind::Udif {
+        return Err(crate::Error::InvalidArgument(
+            "convert: DMG encryption requires a UDIF target".into(),
+        ));
+    }
     let source = ImageKind::detect(src)?;
     #[cfg_attr(not(feature = "dmg"), allow(unused_mut))]
     let mut dropped: Vec<String> = Vec::new();
@@ -313,6 +378,34 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                     }
                 }
                 wo.validate()?;
+                #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+                let summary = if let Some(enc) = &opts.dmg_encryption {
+                    use crate::block::dmg::encrypted::{
+                        CreateOptions, EncryptedDmgSink, OsRandom, Protector,
+                    };
+                    write_beside(dst, |tmp| {
+                        let f = std::fs::File::create(tmp)?;
+                        let sink = EncryptedDmgSink::new(
+                            f,
+                            vec![Protector::Passphrase(&enc.passphrase)],
+                            enc.cipher,
+                            CreateOptions::default(),
+                            &mut OsRandom,
+                        )?;
+                        let (sink, summary) = write_udif(dev.as_mut(), sink, &wo)?;
+                        let (f, _created) = sink.finish(&mut OsRandom)?;
+                        f.sync_all()?;
+                        Ok(summary)
+                    })?
+                } else {
+                    write_beside(dst, |tmp| {
+                        let f = std::fs::File::create(tmp)?;
+                        let (f, summary) = write_udif(dev.as_mut(), f, &wo)?;
+                        f.sync_all()?;
+                        Ok(summary)
+                    })?
+                };
+                #[cfg(not(feature = "dmg-encrypted-write"))]
                 let summary = write_beside(dst, |tmp| {
                     let f = std::fs::File::create(tmp)?;
                     let (f, summary) = write_udif(dev.as_mut(), f, &wo)?;
@@ -365,4 +458,128 @@ pub(crate) fn copy_sectors(
         off += n as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_source_password() {
+        let mut opts = ConvertOptions::default();
+        assert!(format!("{opts:?}").contains("password: None"));
+        opts.password = Some("source-secret-sentinel".into());
+        for text in [format!("{opts:?}"), format!("{opts:#?}")] {
+            assert!(!text.contains("source-secret-sentinel"));
+            assert!(text.contains("<redacted>"));
+            assert!(text.contains("target"));
+        }
+    }
+
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn encrypted_options() -> ConvertOptions {
+        let mut opts = ConvertOptions::default();
+        opts.dmg_encryption = Some(DmgEncryption::new(
+            crate::block::dmg::encrypted::ContentCipher::Aes256,
+            "output-secret-sentinel",
+        ));
+        opts
+    }
+
+    #[test]
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn debug_redacts_output_password() {
+        let mut opts = encrypted_options();
+        opts.password = Some("source-secret-sentinel".into());
+        let enc = opts.dmg_encryption.as_ref().unwrap();
+        for text in [
+            format!("{enc:?}"),
+            format!("{enc:#?}"),
+            format!("{opts:?}"),
+            format!("{opts:#?}"),
+        ] {
+            assert!(!text.contains("output-secret-sentinel"));
+            assert!(!text.contains("source-secret-sentinel"));
+            assert!(text.contains("<redacted>"));
+            assert!(text.contains("Aes256"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn encryption_rejects_non_udif_without_touching_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.raw");
+        std::fs::write(&src, [0x42; 512]).unwrap();
+        let mut cases = vec![];
+        for ext in ["img", "sparseimage", "sparsebundle", "qcow2", "qcow", "q2"] {
+            cases.push((None, format!("output.{ext}")));
+        }
+        for target in [
+            ImageKind::Raw,
+            ImageKind::SparseImage,
+            ImageKind::SparseBundle,
+            ImageKind::Qcow2,
+            ImageKind::Other,
+        ] {
+            cases.push((Some(target), "output.dmg".into()));
+        }
+        for (target, name) in cases {
+            let mut opts = encrypted_options();
+            opts.target = target;
+            let dst = dir.path().join(name);
+            for existing in [false, true] {
+                if existing {
+                    std::fs::write(&dst, b"keep existing").unwrap();
+                }
+                let error = convert_image(&src, &dst, &opts).unwrap_err();
+                assert!(matches!(error, crate::Error::InvalidArgument(_)));
+                assert!(error.to_string().contains("requires a UDIF target"));
+                if existing {
+                    assert_eq!(std::fs::read(&dst).unwrap(), b"keep existing");
+                    std::fs::remove_file(&dst).unwrap();
+                } else {
+                    assert!(!dst.exists());
+                }
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn encrypted_udif_and_plain_raw_remain_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.raw");
+        let data = vec![0x42; 1024];
+        std::fs::write(&src, &data).unwrap();
+        for (target, name) in [
+            (None, "encrypted.dmg"),
+            (Some(ImageKind::Udif), "encrypted.img"),
+        ] {
+            let mut opts = encrypted_options();
+            opts.target = target;
+            opts.udif.format = crate::block::dmg::UdifFormat::Udro;
+            let dst = dir.path().join(name);
+            convert_image(&src, &dst, &opts).unwrap();
+            assert!(crate::block::dmg::probe_encrypted(&dst).unwrap());
+            let mut decoded = open_source(&dst, Some("output-secret-sentinel")).unwrap();
+            assert_eq!(decoded.total_size(), data.len() as u64);
+            let mut actual = vec![0; data.len()];
+            decoded.read_at(0, &mut actual).unwrap();
+            assert_eq!(actual, data);
+
+            // `ls` / `cat` / `info` use the read-write opener.
+            let mut rw =
+                crate::block::open_image_with_password(&dst, Some("output-secret-sentinel"))
+                    .unwrap();
+            assert_eq!(rw.total_size(), data.len() as u64);
+            let mut actual_rw = vec![0; data.len()];
+            rw.read_at(0, &mut actual_rw).unwrap();
+            assert_eq!(actual_rw, data);
+        }
+        let dst = dir.path().join("plain.img");
+        convert_image(&src, &dst, &ConvertOptions::default()).unwrap();
+        assert_eq!(std::fs::read(dst).unwrap(), data);
+    }
 }

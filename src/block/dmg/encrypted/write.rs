@@ -1248,6 +1248,169 @@ pub fn remove_key_record_with<F: Read + Write + Seek + ?Sized>(
     Ok(())
 }
 
+/// A [`Write`] + [`Seek`] sink that encrypts a payload into an
+/// `encrcdsa` v2 image as it is written.
+///
+/// This is the streaming counterpart of [`create_encrypted_image`]: a
+/// producer such as the UDIF writer can compress and encrypt in one pass,
+/// with no intermediate file, exactly as `hdiutil convert -encryption`
+/// does. Payload bytes are buffered into [`CreateOptions::chunk_size`]
+/// chunks and AES-CBC encrypted with the per-chunk IV; the `encrcdsa`
+/// header is written at offset 0 by [`finish`](Self::finish), after the
+/// final (zero-padded) chunk.
+///
+/// The sink is forward-only: `UdifWriter` only asks for
+/// [`stream_position`](Seek::stream_position) at the start. Any other
+/// seek is refused.
+///
+/// On error the caller must discard the output; nothing here publishes
+/// it (see [`create_encrypted_image`] for the same contract).
+pub struct EncryptedDmgSink<'a, W: Write + Seek> {
+    out: W,
+    protectors: Vec<Protector<'a>>,
+    keys: ContentKeys,
+    opts: CreateOptions,
+    chunk_size: usize,
+    buf: SecretBytes,
+    buf_len: usize,
+    chunk_index: u64,
+    payload_len: u64,
+}
+
+impl<'a, W: Write + Seek> EncryptedDmgSink<'a, W> {
+    /// Start an image at offset 0 of `out`, leaving room for the header
+    /// and positioning the sink at the first payload chunk.
+    ///
+    /// `protectors` must contain at least one passphrase or recipient, and
+    /// `opts.chunk_size` / `opts.pbkdf2_iterations` are validated here so
+    /// a bad value fails before any payload is streamed.
+    pub fn new(
+        mut out: W,
+        protectors: Vec<Protector<'a>>,
+        cipher: ContentCipher,
+        opts: CreateOptions,
+        rng: &mut dyn RandomSource,
+    ) -> Result<Self> {
+        check_record_kinds(protectors.iter().map(Protector::kind))?;
+        check_iterations(opts.pbkdf2_iterations)?;
+        let cs = opts.chunk_size;
+        if cs == 0 || !cs.is_multiple_of(16) || cs > MAX_CHUNK_SIZE {
+            return Err(crate::Error::InvalidArgument(format!(
+                "encrcdsa: chunk size {cs} must be a positive multiple of 16, at most \
+                 {MAX_CHUNK_SIZE}"
+            )));
+        }
+        let keys = ContentKeys::generate(cipher, rng);
+        // Clear the header region so a reused destination cannot keep a
+        // stale (valid-looking) header, and park the cursor at the first
+        // payload chunk. Writes then stay sequential.
+        out.seek(SeekFrom::Start(0))?;
+        out.write_all(&vec![0u8; ENCRYPTED_DATA_OFFSET as usize])?;
+        Ok(Self {
+            out,
+            protectors,
+            keys,
+            chunk_size: cs as usize,
+            buf: SecretBytes(vec![0u8; cs as usize]),
+            buf_len: 0,
+            chunk_index: 0,
+            payload_len: 0,
+            opts,
+        })
+    }
+
+    /// Encrypt and write the buffered chunk.
+    fn write_chunk(&mut self) -> Result<()> {
+        let idx = u32::try_from(self.chunk_index).map_err(|_| {
+            crate::Error::InvalidArgument(
+                "encrcdsa: more chunks than the 32-bit IV counter allows; \
+                 use a larger chunk size"
+                    .into(),
+            )
+        })?;
+        let iv = chunk_iv(self.keys.hmac_key(), idx);
+        aes_cbc_encrypt(self.keys.aes_key(), &iv, &mut self.buf.0)?;
+        self.out.write_all(&self.buf.0)?;
+        self.buf.0.fill(0);
+        self.buf_len = 0;
+        self.chunk_index += 1;
+        Ok(())
+    }
+
+    /// Flush the final partial chunk (zero-padded), write the header at
+    /// offset 0, and return the sink's output plus what was written.
+    pub fn finish(mut self, rng: &mut dyn RandomSource) -> Result<(W, CreatedImage)> {
+        if self.buf_len > 0 {
+            self.buf.0[self.buf_len..].fill(0);
+            self.write_chunk()?;
+        }
+        let plan = Plan::new(
+            self.payload_len,
+            &self.protectors,
+            &self.keys,
+            &self.opts,
+            rng,
+        )?;
+        if plan.n_chunks != self.chunk_index {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: wrote {} chunks for a {}-byte payload, expected {}",
+                self.chunk_index, self.payload_len, plan.n_chunks
+            )));
+        }
+        self.out.seek(SeekFrom::Start(0))?;
+        self.out.write_all(&plan.header)?;
+        self.out.flush()?;
+        Ok((
+            self.out,
+            CreatedImage {
+                image_len: ENCRYPTED_DATA_OFFSET + plan.n_chunks * u64::from(plan.chunk_size),
+                payload_len: self.payload_len,
+                uuid: plan.uuid,
+            },
+        ))
+    }
+}
+
+impl<W: Write + Seek> Write for EncryptedDmgSink<'_, W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut off = 0;
+        while off < data.len() {
+            let take = (self.chunk_size - self.buf_len).min(data.len() - off);
+            self.buf.0[self.buf_len..self.buf_len + take].copy_from_slice(&data[off..off + take]);
+            self.buf_len += take;
+            self.payload_len += take as u64;
+            off += take;
+            if self.buf_len == self.chunk_size {
+                self.write_chunk()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+impl<W: Write + Seek> Seek for EncryptedDmgSink<'_, W> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let cur = self.payload_len;
+        match pos {
+            SeekFrom::Current(0) => Ok(cur),
+            SeekFrom::Start(n) if n == cur => Ok(cur),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "encrypted DMG sink is forward-only",
+            )),
+        }
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.payload_len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::EncryptedDmgBackend;

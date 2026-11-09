@@ -39,6 +39,8 @@ pub use checksum::{
     ChecksumAlgorithm, ChecksumHasher, ChecksumOptions, ChecksumScope, ImageChecksum,
     image_checksum,
 };
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+pub use convert::DmgEncryption;
 pub use convert::{ConvertOptions, ConvertReport, ImageKind, ResourcePolicy, convert_image};
 pub use resize::{ContainerResizeOptions, ContainerResizeReport, ShrinkData, resize_container};
 
@@ -62,45 +64,10 @@ pub(crate) const COPY_CHUNK: usize = 1 << 20;
 /// Open `path` read-only as the logical sectors it holds, with an explicit
 /// passphrase for encrypted containers.
 ///
-/// Beyond [`crate::block::open_image_read_only_with_password`], this
-/// opens a passphrase-protected `.dmg` (`encrcdsa`): with no passphrase it
-/// is refused rather than read as ciphertext, and its plaintext — a UDIF
-/// image, or bare sectors — is decoded.
+/// Delegates to [`crate::block::open_image_read_only_with_password`], which
+/// handles `encrcdsa` `.dmg` (UDIF or bare-sector payload) as well as LUKS
+/// and encrypted qcow2.
 pub(crate) fn open_source(path: &Path, password: Option<&str>) -> Result<Box<dyn BlockDevice>> {
-    #[cfg(feature = "dmg")]
-    if crate::block::dmg::probe_encrypted(path)? {
-        let Some(pw) = password else {
-            return Err(crate::Error::InvalidArgument(format!(
-                "{} is a passphrase-protected disk image; supply the passphrase",
-                path.display()
-            )));
-        };
-        #[cfg(feature = "dmg-encrypted")]
-        {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut enc = crate::block::dmg::EncryptedDmgBackend::open_with_password(path, pw)?;
-            let len = enc.total_size();
-            let mut magic = [0u8; 4];
-            if len >= crate::block::dmg::KOLY_SIZE {
-                enc.seek(SeekFrom::Start(len - crate::block::dmg::KOLY_SIZE))?;
-                enc.read_exact(&mut magic)?;
-            }
-            enc.seek(SeekFrom::Start(0))?;
-            if u32::from_be_bytes(magic) == crate::block::dmg::KOLY_MAGIC {
-                return Ok(Box::new(crate::block::dmg::DmgBackend::from_reader(
-                    enc, len,
-                )?));
-            }
-            return Ok(Box::new(enc));
-        }
-        #[cfg(not(feature = "dmg-encrypted"))]
-        {
-            let _ = pw;
-            return Err(crate::Error::Unsupported(
-                "encrypted disk images need the `dmg-encrypted` feature".into(),
-            ));
-        }
-    }
     crate::block::open_image_read_only_with_password(path, password)
 }
 

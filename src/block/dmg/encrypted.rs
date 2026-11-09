@@ -178,12 +178,12 @@ pub use write::add_recipient;
 #[cfg(feature = "dmg-encrypted-write")]
 pub use write::{
     ContentCipher, ContentKeys, CreateOptions, CreatedImage, DEFAULT_CHUNK_SIZE,
-    DEFAULT_PBKDF2_ITERATIONS, ENCRYPTED_DATA_OFFSET, EncryptedImageInfo, KeyRecordInfo,
-    KeyRecordKind, MAX_PROTECTORS, OsRandom, PassphraseRecordInfo, Protector, PublicKeyRecordInfo,
-    RandomSource, RekeyOptions, add_passphrase, change_passphrase, create_encrypted_image,
-    create_encrypted_image_from_device, create_encrypted_image_from_device_with,
-    create_encrypted_image_with, inspect_encrypted_image, remove_key_record,
-    remove_key_record_with,
+    DEFAULT_PBKDF2_ITERATIONS, ENCRYPTED_DATA_OFFSET, EncryptedDmgSink, EncryptedImageInfo,
+    KeyRecordInfo, KeyRecordKind, MAX_PROTECTORS, OsRandom, PassphraseRecordInfo, Protector,
+    PublicKeyRecordInfo, RandomSource, RekeyOptions, add_passphrase, change_passphrase,
+    create_encrypted_image, create_encrypted_image_from_device,
+    create_encrypted_image_from_device_with, create_encrypted_image_with, inspect_encrypted_image,
+    remove_key_record, remove_key_record_with,
 };
 
 /// Eight-byte v2 magic at file offset 0.

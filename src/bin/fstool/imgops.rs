@@ -392,6 +392,16 @@ pub struct LibConvert<'a> {
     pub drop_resources: bool,
     pub remove_signature: bool,
     pub discard_legacy_fork: bool,
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    pub dmg_encryption: Option<DmgEncryption<'a>>,
+}
+
+/// Passphrase and cipher for an `encrcdsa`-encrypted `.dmg` output.
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+#[derive(Clone, Copy)]
+pub struct DmgEncryption<'a> {
+    pub passphrase: &'a str,
+    pub cipher: &'a str,
 }
 
 /// `convert` through `fstool::block::imageops::convert_image`: any UDIF
@@ -458,6 +468,25 @@ pub fn lib_convert(a: LibConvert<'_>) -> fstool::Result<()> {
     }
     #[cfg(not(feature = "dmg-write"))]
     let _ = (a.format, a.level, a.checksum, a.layout);
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    if let Some(enc) = a.dmg_encryption {
+        use fstool::block::dmg::encrypted::ContentCipher;
+        let cipher = match enc.cipher.to_ascii_lowercase().replace('_', "-").as_str() {
+            "aes-128" | "aes128" | "128" => ContentCipher::Aes128,
+            "aes-256" | "aes256" | "256" => ContentCipher::Aes256,
+            other => {
+                return Err(fstool::Error::InvalidArgument(format!(
+                    "--dmg-encryption {other:?}: expected AES-128 or AES-256"
+                )));
+            }
+        };
+        o.dmg_encryption = Some(fstool::block::imageops::DmgEncryption::new(
+            cipher,
+            enc.passphrase,
+        ));
+        // `--dmg-encryption` always means a UDIF, whatever the name says.
+        o.target = Some(fstool::block::imageops::ImageKind::Udif);
+    }
     let r = convert_image(a.src, a.dst, &o)?;
     #[cfg(feature = "dmg-write")]
     if let Some(s) = &r.udif {

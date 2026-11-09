@@ -149,6 +149,10 @@ mod host {
             return open_qcow2(path, password, false);
         }
         #[cfg(feature = "dmg")]
+        if let Some(dev) = open_encrypted_dmg(path, password)? {
+            return Ok(dev);
+        }
+        #[cfg(feature = "dmg")]
         if dmg::probe(path)? {
             return Ok(Box::new(DmgBackend::open(path)?));
         }
@@ -198,6 +202,52 @@ mod host {
         } else {
             Box::new(Qcow2Backend::open(path)?)
         })
+    }
+
+    /// If `path` is a passphrase-protected `encrcdsa` `.dmg`, open it and
+    /// expose its plaintext: the UDIF inside (`DmgBackend`) or, when the
+    /// payload is bare sectors, the encrypted backend itself. `Ok(None)`
+    /// when the path is not an encrypted DMG.
+    ///
+    /// This is the single place the openers learn about `encrcdsa`; `convert`
+    /// and `ls`/`cat`/`info` all reach it through here.
+    #[cfg(feature = "dmg")]
+    fn open_encrypted_dmg(
+        path: &Path,
+        password: Option<&str>,
+    ) -> crate::Result<Option<Box<dyn BlockDevice>>> {
+        if !dmg::probe_encrypted(path)? {
+            return Ok(None);
+        }
+        let Some(pw) = password else {
+            return Err(crate::Error::InvalidArgument(format!(
+                "{} is a passphrase-protected disk image; supply the passphrase",
+                path.display()
+            )));
+        };
+        #[cfg(feature = "dmg-encrypted")]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut enc = dmg::EncryptedDmgBackend::open_with_password(path, pw)?;
+            let len = enc.total_size();
+            let mut magic = [0u8; 4];
+            if len >= dmg::KOLY_SIZE {
+                enc.seek(SeekFrom::Start(len - dmg::KOLY_SIZE))?;
+                enc.read_exact(&mut magic)?;
+            }
+            enc.seek(SeekFrom::Start(0))?;
+            if u32::from_be_bytes(magic) == dmg::KOLY_MAGIC {
+                return Ok(Some(Box::new(dmg::DmgBackend::from_reader(enc, len)?)));
+            }
+            return Ok(Some(Box::new(enc)));
+        }
+        #[cfg(not(feature = "dmg-encrypted"))]
+        {
+            let _ = pw;
+            Err(crate::Error::Unsupported(
+                "encrypted disk images need the `dmg-encrypted` feature".into(),
+            ))
+        }
     }
 
     /// If `file` turns out to be a LUKS container, unlock it; otherwise hand
@@ -315,6 +365,10 @@ mod host {
         #[cfg(feature = "qcow2")]
         if Qcow2Backend::probe(path)? {
             return open_qcow2(path, password, true);
+        }
+        #[cfg(feature = "dmg")]
+        if let Some(dev) = open_encrypted_dmg(path, password)? {
+            return Ok(dev);
         }
         #[cfg(feature = "dmg")]
         if dmg::probe(path)? {

@@ -437,6 +437,15 @@ enum Command {
         #[cfg(feature = "dmg-write")]
         #[arg(long, value_name = "LAYOUT")]
         dmg_layout: Option<String>,
+        /// Encrypt a `.dmg` destination with Apple's `encrcdsa` v2
+        /// wrapper: `AES-128` or `AES-256` (the `hdiutil -encryption`
+        /// equivalent). The passphrase comes from `--password` /
+        /// `--password-file` (`-` reads stdin). Combine with
+        /// `--dmg-format ULMO` to match `hdiutil convert -format ULMO
+        /// -encryption AES-256`.
+        #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+        #[arg(long, value_name = "CIPHER")]
+        dmg_encryption: Option<String>,
         /// Discard the source .dmg's resources (licence agreement, …)
         /// instead of carrying them — required when DST cannot hold them.
         #[cfg(feature = "dmg")]
@@ -1147,6 +1156,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
             dmg_checksum,
             #[cfg(feature = "dmg-write")]
             dmg_layout,
+            #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+            dmg_encryption,
             #[cfg(feature = "dmg")]
             drop_resources,
             #[cfg(feature = "dmg")]
@@ -1162,10 +1173,15 @@ fn run(cli: Cli) -> fstool::Result<()> {
         } => {
             #[cfg(feature = "dmg")]
             {
+                #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+                let dmg_encrypting = dmg_encryption.is_some();
+                #[cfg(all(feature = "dmg-write", not(feature = "dmg-encrypted-write")))]
+                let dmg_encrypting = false;
                 #[cfg(feature = "dmg-write")]
                 let to_dmg = dmg_format.is_some()
                     || dmg_checksum.is_some()
                     || dmg_layout.is_some()
+                    || dmg_encrypting
                     || is_dmg_path(&dst);
                 #[cfg(not(feature = "dmg-write"))]
                 let to_dmg = false;
@@ -1216,6 +1232,23 @@ fn run(cli: Cli) -> fstool::Result<()> {
                             ));
                         }
                     }
+                    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+                    let dmg_encrypt = match dmg_encryption.as_deref() {
+                        Some(cipher) => {
+                            let Some(pw) = password.as_deref() else {
+                                return Err(fstool::Error::InvalidArgument(
+                                    "--dmg-encryption needs a passphrase: \
+                                     pass --password or --password-file"
+                                        .into(),
+                                ));
+                            };
+                            Some(imgops::DmgEncryption {
+                                passphrase: pw,
+                                cipher,
+                            })
+                        }
+                        None => None,
+                    };
                     return imgops::lib_convert(imgops::LibConvert {
                         src: &src,
                         dst: &dst,
@@ -1236,6 +1269,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
                         layout: dmg_layout.as_deref(),
                         #[cfg(not(feature = "dmg-write"))]
                         layout: None,
+                        #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+                        dmg_encryption: dmg_encrypt,
                         drop_resources,
                         remove_signature,
                         discard_legacy_fork: discard_legacy_resource_fork,
