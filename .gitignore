@@ -15,3 +15,11 @@
 /*.qcow2
 /*.img
 /ihic_archive_img_*.tar.gz
+
+# Local static build outputs. `build.sh` writes fstool, fstool-nopie and
+# fstool-stats beside the source tree; experiment variants (fstool-goldmont,
+# fstool-lto, …) land there too. These are ~14 MB rebuilt artefacts, not
+# source: the companion tree under ~/dev/fstool-build owns the build recipe,
+# and the deployed copies live on the target hosts.
+/fstool
+/fstool-*
