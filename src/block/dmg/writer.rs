@@ -702,9 +702,23 @@ struct ChunkDone {
 }
 
 /// Metadata kept by the main thread for each dispatched chunk.
+#[derive(Clone, Copy)]
 struct ChunkMeta {
     sector: u64,
     count: u64,
+}
+
+/// An item in the ordered output sequence: a compressed/raw data chunk or a
+/// zero/ignore run. Zero entries have no payload and get their data-fork
+/// offset when published, so they never force a compression drain.
+#[derive(Clone, Copy)]
+enum Meta {
+    Data(ChunkMeta),
+    Zero {
+        kind: ChunkType,
+        sector: u64,
+        count: u64,
+    },
 }
 
 /// A bounded compression worker pool. Only `encode_chunk` runs in the
@@ -722,7 +736,7 @@ struct Parallel {
     next_send: u64,
     next_write: u64,
     ready: BTreeMap<u64, ChunkDone>,
-    meta: VecDeque<ChunkMeta>,
+    meta: VecDeque<Meta>,
     free: Vec<Vec<u8>>,
     chunk_bytes: usize,
 }
@@ -769,6 +783,8 @@ impl Parallel {
             next_sender: 0,
             rx,
             workers,
+            // Bounded in-flight chunks. Larger windows did not change
+            // throughput in testing, so keep the memory bounded.
             window: (threads * 4).max(2),
             in_flight: 0,
             next_send: 0,
@@ -1074,18 +1090,26 @@ impl<W: Write + Seek> UdifWriter<W> {
 
     fn close_zero_run(&mut self) -> Result<()> {
         if let Some((sector, count)) = self.zero_run.take() {
-            // A zero entry's offset is the data fork's current end, so
-            // any compressed chunks before it must be written first.
-            if self.parallel.is_some() {
-                self.drain_all()?;
+            let kind = self.zero_kind();
+            if let Some(p) = self.parallel.as_mut() {
+                // No payload: enqueue the zero entry in the ordered
+                // sequence. Its data-fork offset is assigned when it is
+                // published, so this must not drain compression.
+                p.meta.push_back(Meta::Zero {
+                    kind,
+                    sector,
+                    count,
+                });
+                p.next_send += 1;
+            } else {
+                self.entries.push(Entry {
+                    kind,
+                    sector,
+                    count,
+                    offset: self.fork_len,
+                    length: 0,
+                });
             }
-            self.entries.push(Entry {
-                kind: self.zero_kind(),
-                sector,
-                count,
-                offset: self.fork_len,
-                length: 0,
-            });
         }
         Ok(())
     }
@@ -1128,10 +1152,10 @@ impl<W: Write + Seek> UdifWriter<W> {
         let index = p.next_send;
         p.next_send += 1;
         p.in_flight += 1;
-        p.meta.push_back(ChunkMeta {
+        p.meta.push_back(Meta::Data(ChunkMeta {
             sector: self.pending_start,
             count,
-        });
+        }));
         let sender = p.senders[p.next_sender].clone();
         p.next_sender = (p.next_sender + 1) % p.senders.len();
         let sent = sender.send(ChunkJob { index, plain });
@@ -1147,8 +1171,9 @@ impl<W: Write + Seek> UdifWriter<W> {
         r
     }
 
-    /// Wait for every dispatched chunk and write it. Used at zero-run and
-    /// region boundaries, where the data fork's current end is recorded.
+    /// Wait for every dispatched chunk and write it. Used at region
+    /// boundaries and finalization; zero-run items are ordinary ordered
+    /// sequence entries and no longer force a drain.
     fn drain_all(&mut self) -> Result<()> {
         let Some(mut p) = self.parallel.take() else {
             return Ok(());
@@ -1188,39 +1213,72 @@ impl<W: Write + Seek> UdifWriter<W> {
             p.ready.insert(done.index, done);
             self.emit_ready(p)?;
         }
+        // Publish any zero-run items sitting at the head (they have no
+        // worker result to wait for).
+        self.emit_ready(p)?;
         Ok(())
     }
 
     /// Write completed chunks in dispatch order, updating the data-fork
     /// checksum and the mish descriptors exactly as the sequential path.
     fn emit_ready(&mut self, p: &mut Parallel) -> Result<()> {
-        while let Some(done) = p.ready.remove(&p.next_write) {
-            let meta = p.meta.pop_front().ok_or_else(|| {
-                crate::Error::InvalidArgument("dmg: chunk metadata underflow".into())
-            })?;
-            let ChunkDone { encoded, plain, .. } = done;
-            let (kind, payload, recycle) = match encoded {
-                Some((kind, bytes)) if bytes.len() < plain.len() => (kind, bytes, Some(plain)),
-                _ => (ChunkType::Raw, plain, None),
+        loop {
+            let Some(front) = p.meta.front().copied() else {
+                break;
             };
-            self.out.write_all(&payload)?;
-            self.fork_sum.update(&payload);
-            let length = payload.len() as u64;
-            self.entries.push(Entry {
-                kind,
-                sector: meta.sector,
-                count: meta.count,
-                offset: self.fork_len,
-                length,
-            });
-            self.fork_len += length;
-            p.next_write += 1;
-            p.in_flight -= 1;
-            if let Some(buf) = recycle {
-                p.recycle(buf);
-            }
-            if kind == ChunkType::Raw {
-                p.recycle(payload);
+            match front {
+                Meta::Zero {
+                    kind,
+                    sector,
+                    count,
+                } => {
+                    p.meta.pop_front();
+                    self.entries.push(Entry {
+                        kind,
+                        sector,
+                        count,
+                        offset: self.fork_len,
+                        length: 0,
+                    });
+                    p.next_write += 1;
+                }
+                Meta::Data(_) => {
+                    let Some(done) = p.ready.remove(&p.next_write) else {
+                        break;
+                    };
+                    let meta = p.meta.pop_front().ok_or_else(|| {
+                        crate::Error::InvalidArgument("dmg: chunk metadata underflow".into())
+                    })?;
+                    let Meta::Data(meta) = meta else {
+                        unreachable!("front was checked as data");
+                    };
+                    let ChunkDone { encoded, plain, .. } = done;
+                    let (kind, payload, recycle) = match encoded {
+                        Some((kind, bytes)) if bytes.len() < plain.len() => {
+                            (kind, bytes, Some(plain))
+                        }
+                        _ => (ChunkType::Raw, plain, None),
+                    };
+                    self.out.write_all(&payload)?;
+                    self.fork_sum.update(&payload);
+                    let length = payload.len() as u64;
+                    self.entries.push(Entry {
+                        kind,
+                        sector: meta.sector,
+                        count: meta.count,
+                        offset: self.fork_len,
+                        length,
+                    });
+                    self.fork_len += length;
+                    p.next_write += 1;
+                    p.in_flight -= 1;
+                    if let Some(buf) = recycle {
+                        p.recycle(buf);
+                    }
+                    if kind == ChunkType::Raw {
+                        p.recycle(payload);
+                    }
+                }
             }
         }
         Ok(())
@@ -1230,9 +1288,8 @@ impl<W: Write + Seek> UdifWriter<W> {
     fn close_region(&mut self) -> Result<()> {
         self.flush_pending()?;
         self.close_zero_run()?;
-        // `close_zero_run` drains only when it actually closes a run; a
-        // region that ends on a compressed chunk still needs the pool
-        // empty before its mish table is built.
+        // Region boundaries still wait for every item in the region so its
+        // mish table and checksum are complete.
         self.drain_all()?;
         if self.entries.len() >= u32::MAX as usize {
             return Err(crate::Error::Unsupported(
@@ -2456,5 +2513,30 @@ mod tests {
         o.validate().unwrap();
         o.threads = 0;
         o.validate().unwrap();
+    }
+
+    #[test]
+    fn parallel_udzo_matches_sequential_alternating_zero_runs() {
+        // Many zero-run boundaries: 1 MiB data / 3 MiB zeros, repeated.
+        let mut disk = Vec::new();
+        for _ in 0..16 {
+            let mut data = vec![0x5Au8; 1024 * 1024];
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = b.wrapping_add((i % 251) as u8);
+            }
+            disk.extend_from_slice(&data);
+            disk.extend_from_slice(&vec![0u8; 3 * 1024 * 1024]);
+        }
+        let mut one = opts(UdifFormat::Udzo);
+        one.chunk_sectors = 2048;
+        one.threads = 1;
+        let mut many = one.clone();
+        many.threads = 3;
+        let (a, sa) = roundtrip(&one, &disk);
+        let (b, sb) = roundtrip(&many, &disk);
+        assert!(a == b, "parallel alternating-zero output differs");
+        assert_eq!(sa.chunk_count, sb.chunk_count);
+        assert_eq!(sa.data_fork_crc32, sb.data_fork_crc32);
+        assert_eq!(sa.master_crc32, sb.master_crc32);
     }
 }
