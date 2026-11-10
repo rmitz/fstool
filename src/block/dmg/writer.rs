@@ -1093,6 +1093,14 @@ enum Meta {
     },
 }
 
+/// Clone a stats handle. The no-op stats type is `Copy`, while the
+/// `udif-stats` build's handle owns an `Arc`; this keeps both builds happy
+/// without a feature-dependent `clone_on_copy` lint.
+#[allow(clippy::clone_on_copy)]
+fn clone_stats(stats: &udif_stats::Stats) -> udif_stats::Stats {
+    stats.clone()
+}
+
 /// A bounded compression worker pool. Only `encode_chunk` runs in the
 /// workers; sector scanning, zero-run handling, checksums, ordering and
 /// output all stay on the main thread, so parallel output is byte-identical
@@ -1129,13 +1137,13 @@ impl Parallel {
         for index in 0..threads {
             let (job_tx, job_rx) = mpsc::channel::<ChunkJob>();
             let tx = tx.clone();
-            let stats = stats.clone();
+            let worker_stats = clone_stats(&stats);
             let worker = std::thread::Builder::new()
                 .name("fstool-udif".into())
                 .spawn(move || {
                     while let Ok(job) = job_rx.recv() {
-                        stats.worker_started(index);
-                        stats.job_start();
+                        worker_stats.worker_started(index);
+                        worker_stats.job_start();
                         let t = std::time::Instant::now();
                         let result =
                             encode_chunk(format, level, &job.plain).map(|encoded| ChunkDone {
@@ -1143,7 +1151,7 @@ impl Parallel {
                                 encoded,
                                 plain: job.plain,
                             });
-                        stats.job_end(t.elapsed().as_nanos() as u64);
+                        worker_stats.job_end(t.elapsed().as_nanos() as u64);
                         if tx.send(result).is_err() {
                             break;
                         }
@@ -1330,7 +1338,7 @@ impl<W: Write + Seek> UdifWriter<W> {
                 opts.level,
                 threads,
                 chunk_bytes,
-                stats.clone(),
+                clone_stats(&stats),
             )?)
         } else {
             None
@@ -1366,7 +1374,7 @@ impl<W: Write + Seek> UdifWriter<W> {
 
     /// Handle for the optional `udif-stats` counters.
     pub(crate) fn stats_handle(&self) -> udif_stats::Stats {
-        self.stats.clone()
+        clone_stats(&self.stats)
     }
 
     /// Append whole sectors. `data.len()` must be a multiple of 512, and
@@ -1694,10 +1702,7 @@ impl<W: Write + Seek> UdifWriter<W> {
     /// Write completed chunks in dispatch order, updating the data-fork
     /// checksum and the mish descriptors exactly as the sequential path.
     fn emit_ready(&mut self, p: &mut Parallel) -> Result<()> {
-        loop {
-            let Some(front) = p.meta.front().copied() else {
-                break;
-            };
+        while let Some(front) = p.meta.front().copied() {
             match front {
                 Meta::Zero {
                     kind,

@@ -467,8 +467,10 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                     use std::sync::mpsc;
                     write_beside(dst, |tmp| {
                         let f = std::fs::File::create(tmp)?;
-                        let mut copts = CreateOptions::default();
-                        copts.chunk_size = enc.chunk_size;
+                        let copts = CreateOptions {
+                            chunk_size: enc.chunk_size,
+                            ..CreateOptions::default()
+                        };
                         let (tx, rx) = mpsc::sync_channel::<SinkMsg>(64);
                         std::thread::scope(
                             |scope| -> crate::Result<crate::block::dmg::UdifSummary> {
@@ -601,12 +603,13 @@ mod security_tests {
 
     #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
     fn encrypted_options() -> ConvertOptions {
-        let mut opts = ConvertOptions::default();
-        opts.dmg_encryption = Some(DmgEncryption::new(
-            crate::block::dmg::encrypted::ContentCipher::Aes256,
-            "output-secret-sentinel",
-        ));
-        opts
+        ConvertOptions {
+            dmg_encryption: Some(DmgEncryption::new(
+                crate::block::dmg::encrypted::ContentCipher::Aes256,
+                "output-secret-sentinel",
+            )),
+            ..ConvertOptions::default()
+        }
     }
 
     #[test]
