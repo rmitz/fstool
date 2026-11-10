@@ -294,6 +294,14 @@ json = ["std", "dep:serde", "dep:serde_json"]
 # recovered from rather than failed on. Off, they compile to nothing.
 log = ["dep:log"]
 
+# UDIF write-pipeline counters for debugging a slow conversion. A stats
+# build (compile with `--features udif-stats`) prints a line per second to
+# stderr when `FSTOOL_UDIF_STATS=1`: source/zero/data bytes, job sizes,
+# queue depth, oldest unpublished sequence, producer waits and worker
+# encode time. Off by default; normal builds contain no atomics or
+# reporter thread.
+udif-stats = ["std"]
+
 # Unix host integration: querying a real block device's capacity
 # (`BLKGETSIZE64` / `DKIOCGETBLOCK*`), opening one `O_EXCL` so the kernel
 # refuses a mounted disk, terminal width for the progress line, and the
