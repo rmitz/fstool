@@ -193,9 +193,11 @@ enum Command {
         /// cramfs / xfs / iso / iso9660 / udf / grf / apfs.
         #[arg(short = 't', long = "type", value_name = "TYPE")]
         fs_type: String,
-        /// Optional source directory on the host. Omit to create an
-        /// empty filesystem (subject to per-FS minimum sizes).
-        #[arg(value_name = "SRC_DIR")]
+        /// Optional source: a host directory, a tar archive (including
+        /// `.tar.gz` and the other supported codecs), or an existing
+        /// image with an optional `:N` partition selector. Omit to
+        /// create an empty filesystem (subject to per-FS minimum sizes).
+        #[arg(value_name = "SOURCE")]
         src_dir: Option<PathBuf>,
         /// Output image file or block device. Block devices are formatted
         /// to their full capacity; regular files are auto-sized when the
@@ -3815,9 +3817,20 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
 
     // Resolve an optional source. The destination size is derived from
     // it where the FS supports auto-sizing; otherwise --size wins.
+    // `Source::detect` accepts a host directory, a (compressed) tar, or
+    // an existing image, so `create -t hfsplus backup.tar.gz` works
+    // without a TOML spec.
     let source = args
         .src_dir
-        .map(|p| fstool::repack::Source::HostDir(p.to_path_buf()));
+        .map(|p| {
+            let s = p.to_str().ok_or_else(|| {
+                fstool::Error::InvalidArgument(format!(
+                    "create: source path {p:?} is not valid UTF-8"
+                ))
+            })?;
+            fstool::repack::Source::detect(s)
+        })
+        .transpose()?;
 
     // Per-FS dispatch. Each arm consumes the relevant keys from `opts`,
     // calls `check_empty`, sizes the destination, then formats +

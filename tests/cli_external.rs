@@ -2647,3 +2647,59 @@ fn cli_refuses_encrypt_without_a_passphrase() {
     assert!(err.contains("passphrase"), "unhelpful error: {err}");
     assert!(!img.exists(), "a rejected create left an image behind");
 }
+
+/// `fstool create -t hfsplus source.tar.gz` must accept an archive
+/// source, not just a host directory, and auto-size from the HFS+ plan.
+#[cfg(all(feature = "hfs-plus", feature = "tar"))]
+#[test]
+fn cli_create_hfsplus_from_tar_source() {
+    if !which("tar") {
+        eprintln!("skipping: tar not installed");
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("hello.txt"), b"hello from tar\n").unwrap();
+
+    let targz = work.path().join("source.tar.gz");
+    let made = Command::new("tar")
+        .arg("-czf")
+        .arg(&targz)
+        .arg("-C")
+        .arg(&src)
+        .arg(".")
+        .status()
+        .unwrap();
+    assert!(made.success(), "tar failed");
+
+    let img = work.path().join("out.img");
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "hfsplus"])
+        .arg(&targz)
+        .arg("-o")
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create from tar failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let len = std::fs::metadata(&img).unwrap().len();
+    assert!(
+        len < 256 * 1024 * 1024,
+        "create used the old 256 MiB fallback: {len} bytes"
+    );
+
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(&img)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(listing.contains("hello.txt"), "listing: {listing}");
+}
