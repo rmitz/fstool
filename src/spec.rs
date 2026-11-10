@@ -478,15 +478,35 @@ fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
     output: &Path,
     opts: F::FormatOpts,
 ) -> Result<()> {
+    let source = match &fs.source {
+        Some(src) => Some(source_from_spec(src)?),
+        None => None,
+    };
     let bytes = match fs.size.as_deref() {
         Some(s) => parse_size(s)?,
-        None => 256 * 1024 * 1024,
+        None => match &source {
+            Some(src) => match F::size_plan(&opts) {
+                // Exact content-fit sizing for backends with an analytic
+                // plan (HFS+, XFS, NTFS, …).
+                Some(mut plan) => crate::analyze::plan_size(src, plan.as_mut())?,
+                // Streaming / archive backends: over-provision, then cut
+                // the file back to `image_len()` after flush.
+                None => {
+                    let analysis = crate::analyze::analyze_source(src, 1024)?;
+                    analysis
+                        .total_file_bytes
+                        .saturating_mul(2)
+                        .saturating_add(64 * 1024 * 1024)
+                        .max(256 * 1024 * 1024)
+                }
+            },
+            None => 256 * 1024 * 1024,
+        },
     };
     let mut dev = crate::block::create_image(output, bytes, &crate::block::CreateOpts::default())?;
     let mut fs_obj = F::format(dev.as_mut(), &opts)?;
-    if let Some(src) = &fs.source {
-        let source = source_from_spec(src)?;
-        crate::repack::populate_fs_from_source(dev.as_mut(), &mut fs_obj, &source)?;
+    if let Some(src) = &source {
+        crate::repack::populate_fs_from_source(dev.as_mut(), &mut fs_obj, src)?;
     }
     fs_obj.flush(dev.as_mut())?;
     dev.sync()?;
@@ -1517,6 +1537,50 @@ mod tests {
             "expected hello.txt in root, got {names:?}"
         );
         drop(ext);
+        drop(dev);
+        let _ = std::fs::remove_file(&tar_path);
+        let _ = std::fs::remove_file(&img);
+    }
+
+    /// HFS+ has an analytic size plan, so a tar source with no explicit
+    /// `size` must be sized from its content — not the old flat 256 MiB
+    /// fallback. A tiny tar therefore produces a tiny image.
+    #[cfg(all(feature = "hfs-plus", feature = "tar"))]
+    #[test]
+    fn build_bare_hfsplus_from_tar_source_auto_sizes() {
+        let tmp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let tar_path = tmp_dir.join(format!("fstool-spec-hfs-src-{pid}.tar"));
+        let img = tmp_dir.join(format!("fstool-spec-hfs-{pid}.img"));
+        let _ = std::fs::remove_file(&tar_path);
+        let _ = std::fs::remove_file(&img);
+        write_minimal_tar(&tar_path);
+
+        let toml = format!(
+            r#"
+                [filesystem]
+                type = "hfsplus"
+                source = {src:?}
+            "#,
+            src = tar_path.to_string_lossy(),
+        );
+        let spec = Spec::parse(&toml).unwrap();
+        build(&spec, &img).unwrap();
+
+        let len = std::fs::metadata(&img).unwrap().len();
+        assert!(
+            len < 256 * 1024 * 1024,
+            "auto-size did not use the HFS+ plan: {len} bytes"
+        );
+        let mut dev = crate::block::FileBackend::open(&img).unwrap();
+        let mut hfs = crate::fs::hfs_plus::HfsPlus::open(&mut dev).unwrap();
+        let entries =
+            crate::fs::Filesystem::list(&mut hfs, &mut dev, std::path::Path::new("/")).unwrap();
+        assert!(
+            entries.iter().any(|e| e.name == "hello.txt"),
+            "hello.txt missing from HFS+ root"
+        );
+        drop(hfs);
         drop(dev);
         let _ = std::fs::remove_file(&tar_path);
         let _ = std::fs::remove_file(&img);
