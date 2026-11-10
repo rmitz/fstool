@@ -119,6 +119,10 @@ const READ_AHEAD: usize = 8 << 20;
 /// reader's [`MAX_CHUNK_SECTORS`] so a writer-produced image always
 /// re-opens.
 const MAX_ZERO_RUN_SECTORS: u64 = 1 << 20;
+/// Longest zero run folded into a neighbouring data chunk instead of
+/// getting its own `blkx` entry. Fragmented images otherwise turn every
+/// small hole into a tiny compression job and an extra ordering boundary.
+const ZERO_COALESCE_SECTORS: u64 = 128; // 64 KiB
 const _: () = assert!(MAX_ZERO_RUN_SECTORS <= MAX_CHUNK_SECTORS);
 const _: () = assert!(MAX_WRITE_CHUNK_SECTORS as u64 <= MAX_CHUNK_SECTORS);
 /// Most `blkx` entries a [`UdifLayout::Map`] may have. GPT tops out
@@ -1049,19 +1053,40 @@ impl<W: Write + Seek> UdifWriter<W> {
                 self.close_region()?;
             }
             if elide && is_zero(sector) {
-                self.flush_pending()?;
-                match &mut self.zero_run {
-                    Some((_, n)) if *n < MAX_ZERO_RUN_SECTORS => *n += 1,
-                    _ => {
-                        self.close_zero_run()?;
-                        self.zero_run = Some((lba, 1));
+                // Entering a zero run does not flush a partial data chunk:
+                // a short run is folded into that chunk when it closes.
+                // Only runs that are certainly too long to fold get their
+                // preceding data flushed promptly so a worker can start.
+                let coalesce = self.opts.format.compresses() && self.zero_kind() == ChunkType::Zero;
+                let count = self.zero_run.map(|(_, n)| n).unwrap_or(0);
+                if count == 0 {
+                    self.zero_run = Some((lba, 1));
+                    if !coalesce {
+                        self.flush_pending()?;
+                    }
+                } else if count < MAX_ZERO_RUN_SECTORS {
+                    if let Some((_, n)) = self.zero_run.as_mut() {
+                        *n += 1;
+                    }
+                } else {
+                    // The run hit its descriptor limit; close it and begin
+                    // a new run at this sector.
+                    self.close_zero_run(false)?;
+                    self.zero_run = Some((lba, 1));
+                }
+                if coalesce {
+                    // Once the run no longer fits in the current chunk,
+                    // it cannot be folded; release the preceding data.
+                    let room = chunk_bytes.saturating_sub(self.pending.len());
+                    let limit = ZERO_COALESCE_SECTORS.min((room / SECTOR) as u64);
+                    if self.zero_run.map(|(_, n)| n) == Some(limit + 1) {
+                        self.flush_pending()?;
                     }
                 }
-                if self.zero_kind() == ChunkType::Zero {
-                    self.part_sum.update(sector);
-                }
             } else {
-                self.close_zero_run()?;
+                // Close any zero run first: a short run joins this data
+                // chunk, a long one is emitted as its own entry.
+                self.close_zero_run(true)?;
                 if self.pending.is_empty() {
                     self.pending_start = lba;
                 }
@@ -1088,28 +1113,64 @@ impl<W: Write + Seek> UdifWriter<W> {
         }
     }
 
-    fn close_zero_run(&mut self) -> Result<()> {
-        if let Some((sector, count)) = self.zero_run.take() {
-            let kind = self.zero_kind();
-            if let Some(p) = self.parallel.as_mut() {
-                // No payload: enqueue the zero entry in the ordered
-                // sequence. Its data-fork offset is assigned when it is
-                // published, so this must not drain compression.
-                p.meta.push_back(Meta::Zero {
-                    kind,
-                    sector,
-                    count,
-                });
-                p.next_send += 1;
-            } else {
-                self.entries.push(Entry {
-                    kind,
-                    sector,
-                    count,
-                    offset: self.fork_len,
-                    length: 0,
-                });
+    fn close_zero_run(&mut self, followed_by_data: bool) -> Result<()> {
+        let Some((sector, count)) = self.zero_run.take() else {
+            return Ok(());
+        };
+        let kind = self.zero_kind();
+        let chunk_bytes = self.opts.chunk_sectors as usize * SECTOR;
+        let run_bytes = count as usize * SECTOR;
+        // A short zero run is cheaper folded into the surrounding data
+        // chunk: one compression job instead of an extra tiny job and an
+        // ordering boundary. Only compressed formats benefit (a raw chunk
+        // would store the zeros verbatim), and only a normal `Zero` entry:
+        // free regions, MD5 checksums and `Ignore` runs must stay elided.
+        let coalesce = kind == ChunkType::Zero
+            && self.opts.format.compresses()
+            && count <= ZERO_COALESCE_SECTORS
+            && (followed_by_data || !self.pending.is_empty())
+            && self.pending.len() + run_bytes <= chunk_bytes;
+        if coalesce {
+            if self.pending.is_empty() {
+                self.pending_start = sector;
             }
+            let start = self.pending.len();
+            self.pending.resize(start + run_bytes, 0);
+            // Coalesced zeros still belong to the partition checksum.
+            self.part_sum.update(&self.pending[start..]);
+            if self.pending.len() >= chunk_bytes {
+                self.flush_pending()?;
+            }
+            return Ok(());
+        }
+        // Data before an elided run has to reach the output first.
+        self.flush_pending()?;
+        if kind == ChunkType::Zero {
+            // Zeros were not fed through the data path, but a zero-fill
+            // run still counts toward the partition checksum.
+            let zeros = [0u8; SECTOR];
+            for _ in 0..count {
+                self.part_sum.update(&zeros);
+            }
+        }
+        if let Some(p) = self.parallel.as_mut() {
+            // No payload: enqueue the zero entry in the ordered sequence.
+            // Its data-fork offset is assigned when it is published, so
+            // this must not drain compression.
+            p.meta.push_back(Meta::Zero {
+                kind,
+                sector,
+                count,
+            });
+            p.next_send += 1;
+        } else {
+            self.entries.push(Entry {
+                kind,
+                sector,
+                count,
+                offset: self.fork_len,
+                length: 0,
+            });
         }
         Ok(())
     }
@@ -1286,8 +1347,10 @@ impl<W: Write + Seek> UdifWriter<W> {
 
     /// Finish the current region's mish table and move to the next.
     fn close_region(&mut self) -> Result<()> {
+        // Close the zero run first: a short trailing run may fold into the
+        // pending data chunk.
+        self.close_zero_run(false)?;
         self.flush_pending()?;
-        self.close_zero_run()?;
         // Region boundaries still wait for every item in the region so its
         // mish table and checksum are complete.
         self.drain_all()?;
@@ -2537,6 +2600,65 @@ mod tests {
         assert!(a == b, "parallel alternating-zero output differs");
         assert_eq!(sa.chunk_count, sb.chunk_count);
         assert_eq!(sa.data_fork_crc32, sb.data_fork_crc32);
+        assert_eq!(sa.master_crc32, sb.master_crc32);
+    }
+
+    #[test]
+    fn short_zero_runs_are_folded_into_data_chunks() {
+        // 8 × (16 KiB data + 8 KiB zeros) + one data sector. Each hole is
+        // far below the coalescing threshold, so the whole image is one
+        // chunk instead of 17 tiny data/zero entries.
+        let mut disk = Vec::new();
+        for round in 0..8u8 {
+            for i in 0..32 * SECTOR {
+                disk.push(round.wrapping_mul(17).wrapping_add(i as u8) | 1);
+            }
+            disk.extend(std::iter::repeat_n(0u8, 8 * SECTOR));
+        }
+        disk.extend(std::iter::repeat_n(0x5Au8, SECTOR));
+        let mut o = opts(UdifFormat::Udzo);
+        o.chunk_sectors = 2048;
+        let (_, s) = roundtrip(&o, &disk);
+        assert_eq!(s.chunk_count, 1);
+        assert_eq!(s.partition_crc32, Some(crate::crc::crc32(&disk)));
+    }
+
+    #[test]
+    fn long_zero_runs_are_still_elided() {
+        // A run over the coalescing threshold keeps its compact `Zero`
+        // entry rather than becoming (compressible) data.
+        let mut disk = vec![0x7Fu8; 4 * SECTOR];
+        disk.extend(std::iter::repeat_n(0u8, 2048 * SECTOR));
+        disk.extend(std::iter::repeat_n(0x11u8, 4 * SECTOR));
+        let mut o = opts(UdifFormat::Udzo);
+        o.chunk_sectors = 2048;
+        let (_, s) = roundtrip(&o, &disk);
+        assert_eq!(s.chunk_count, 3);
+        assert_eq!(s.partition_crc32, Some(crate::crc::crc32(&disk)));
+    }
+
+    #[test]
+    fn parallel_udzo_matches_sequential_short_zero_runs() {
+        // Alternate small data and zero runs so coalescing, chunk
+        // boundaries, zero entries and the parallel window interact.
+        let mut disk = Vec::new();
+        for i in 0..64u32 {
+            for j in 0..4 * SECTOR {
+                disk.push((i as u8).wrapping_mul(31).wrapping_add(j as u8) | 1);
+            }
+            disk.extend(std::iter::repeat_n(0u8, 2 * SECTOR));
+        }
+        let mut one = opts(UdifFormat::Udzo);
+        one.chunk_sectors = 32;
+        one.threads = 1;
+        let mut many = one.clone();
+        many.threads = 3;
+        let (a, sa) = roundtrip(&one, &disk);
+        let (b, sb) = roundtrip(&many, &disk);
+        assert!(a == b, "parallel short-zero output differs");
+        assert_eq!(sa.chunk_count, sb.chunk_count);
+        assert_eq!(sa.data_fork_crc32, sb.data_fork_crc32);
+        assert_eq!(sa.partition_crc32, sb.partition_crc32);
         assert_eq!(sa.master_crc32, sb.master_crc32);
     }
 }
