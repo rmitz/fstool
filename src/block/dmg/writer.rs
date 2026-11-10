@@ -94,9 +94,9 @@ mod udif_stats {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::SECTOR;
+    use super::{MAX_WRITE_THREADS, SECTOR};
 
-    const BUCKETS: usize = 24;
+    const BUCKETS: usize = 40;
 
     #[derive(Clone)]
     pub struct Stats {
@@ -106,6 +106,7 @@ mod udif_stats {
     struct Inner {
         start: Instant,
         sectors: AtomicU64,
+        published: AtomicU64,
         zero_sectors: AtomicU64,
         data_sectors: AtomicU64,
         data_bytes: AtomicU64,
@@ -120,9 +121,13 @@ mod udif_stats {
         finalize_nanos: AtomicU64,
         ready: AtomicU64,
         lag: AtomicU64,
+        workers: AtomicU64,
+        queued: [AtomicU64; MAX_WRITE_THREADS],
         min_bytes: AtomicU64,
         max_bytes: AtomicU64,
+        max_enc_nanos: AtomicU64,
         hist: [AtomicU64; BUCKETS],
+        enc_hist: [AtomicU64; BUCKETS],
         stop: AtomicBool,
     }
 
@@ -136,6 +141,7 @@ mod udif_stats {
             let inner = Arc::new(Inner {
                 start: Instant::now(),
                 sectors: AtomicU64::new(0),
+                published: AtomicU64::new(0),
                 zero_sectors: AtomicU64::new(0),
                 data_sectors: AtomicU64::new(0),
                 data_bytes: AtomicU64::new(0),
@@ -150,9 +156,13 @@ mod udif_stats {
                 finalize_nanos: AtomicU64::new(0),
                 ready: AtomicU64::new(0),
                 lag: AtomicU64::new(0),
+                workers: AtomicU64::new(0),
+                queued: std::array::from_fn(|_| AtomicU64::new(0)),
                 min_bytes: AtomicU64::new(u64::MAX),
                 max_bytes: AtomicU64::new(0),
+                max_enc_nanos: AtomicU64::new(0),
                 hist: std::array::from_fn(|_| AtomicU64::new(0)),
+                enc_hist: std::array::from_fn(|_| AtomicU64::new(0)),
                 stop: AtomicBool::new(false),
             });
             let report = Arc::clone(&inner);
@@ -184,6 +194,12 @@ mod udif_stats {
             }
         }
 
+        pub fn add_published_sectors(&self, n: u64) {
+            if let Some(i) = self.inner() {
+                i.published.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+
         pub fn add_zero_sectors(&self, n: u64) {
             if let Some(i) = self.inner() {
                 i.zero_sectors.fetch_add(n, Ordering::Relaxed);
@@ -203,7 +219,7 @@ mod udif_stats {
                 i.data_bytes.fetch_add(b, Ordering::Relaxed);
                 i.min_bytes.fetch_min(b, Ordering::Relaxed);
                 i.max_bytes.fetch_max(b, Ordering::Relaxed);
-                i.hist[bucket(bytes)].fetch_add(1, Ordering::Relaxed);
+                i.hist[bucket(bytes).min(BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -218,6 +234,8 @@ mod udif_stats {
                 i.active.fetch_sub(1, Ordering::Relaxed);
                 i.done.fetch_add(1, Ordering::Relaxed);
                 i.enc_nanos.fetch_add(nanos, Ordering::Relaxed);
+                i.max_enc_nanos.fetch_max(nanos, Ordering::Relaxed);
+                i.enc_hist[bucket64(nanos).min(BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -236,6 +254,30 @@ mod udif_stats {
         pub fn lag(&self, n: u64) {
             if let Some(i) = self.inner() {
                 i.lag.store(n, Ordering::Relaxed);
+            }
+        }
+
+        pub fn init_workers(&self, n: usize) {
+            if let Some(i) = self.inner() {
+                i.workers.store(n as u64, Ordering::Relaxed);
+            }
+        }
+
+        pub fn worker_sent(&self, index: usize) {
+            if let Some(q) = self.inner().and_then(|i| i.queued.get(index)) {
+                q.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        pub fn worker_started(&self, index: usize) {
+            if let Some(q) = self.inner().and_then(|i| i.queued.get(index)) {
+                q.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        pub fn worker_cancelled(&self, index: usize) {
+            if let Some(q) = self.inner().and_then(|i| i.queued.get(index)) {
+                q.fetch_sub(1, Ordering::Relaxed);
             }
         }
 
@@ -281,10 +323,14 @@ mod udif_stats {
     }
 
     fn bucket(bytes: usize) -> usize {
-        if bytes == 0 {
+        bucket64(bytes as u64)
+    }
+
+    fn bucket64(v: u64) -> usize {
+        if v == 0 {
             0
         } else {
-            (usize::BITS - bytes.leading_zeros() - 1) as usize
+            (u64::BITS - v.leading_zeros() - 1) as usize
         }
     }
 
@@ -321,13 +367,24 @@ mod udif_stats {
             v => v,
         };
         let max = i.max_bytes.load(Ordering::Relaxed);
+        let workers = (i.workers.load(Ordering::Relaxed) as usize).min(MAX_WRITE_THREADS);
+        let q = (0..workers)
+            .map(|idx| i.queued[idx].load(Ordering::Relaxed).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let e50 = pct(&i.enc_hist, 50) / 1_000_000;
+        let e95 = pct(&i.enc_hist, 95) / 1_000_000;
+        let emax = i.max_enc_nanos.load(Ordering::Relaxed) / 1_000_000;
         eprintln!(
-            "udif-stats {:>7.1}s src={:>9.1}MiB zero={:>9.1}MiB data={:>9.1}MiB \
-             sub={:>9.1}MiB fork={:>9.1}MiB | jobs={} done={} active={} ready={} lag={} \
-             | size min={}KiB p50={}KiB p95={}KiB max={}KiB small64K={}/{} \
-             | wait read={:.0}ms out={:.0}ms win={:.0}ms fin={:.0}ms | enc={:.1}s",
+            "udif-stats {:>7.1}s src={:>9.1}MiB pub={:>9.1}MiB zero={:>9.1}MiB \
+             data={:>9.1}MiB sub={:>9.1}MiB fork={:>9.1}MiB | jobs={} done={} \
+             active={} ready={} lag={} | size min={}KiB p50={}KiB p95={}KiB \
+             max={}KiB small64K={}/{} | wait read={:.0}ms out={:.0}ms \
+             win={:.0}ms fin={:.0}ms | q=[{}] enc p50={}ms p95={}ms max={}ms \
+             total={:.1}s",
             i.start.elapsed().as_secs_f64(),
             mib(i.sectors.load(Ordering::Relaxed) * SECTOR as u64),
+            mib(i.published.load(Ordering::Relaxed) * SECTOR as u64),
             mib(i.zero_sectors.load(Ordering::Relaxed) * SECTOR as u64),
             mib(i.data_sectors.load(Ordering::Relaxed) * SECTOR as u64),
             mib(i.data_bytes.load(Ordering::Relaxed)),
@@ -347,6 +404,10 @@ mod udif_stats {
             ms(i.out_nanos.load(Ordering::Relaxed)),
             ms(i.window_nanos.load(Ordering::Relaxed)),
             ms(i.finalize_nanos.load(Ordering::Relaxed)),
+            q,
+            e50,
+            e95,
+            emax,
             i.enc_nanos.load(Ordering::Relaxed) as f64 / 1e9,
         );
     }
@@ -364,6 +425,7 @@ mod udif_stats {
             Self
         }
         pub fn add_source_sectors(&self, _n: u64) {}
+        pub fn add_published_sectors(&self, _n: u64) {}
         pub fn add_zero_sectors(&self, _n: u64) {}
         pub fn add_data_sectors(&self, _n: u64) {}
         pub fn job_submitted(&self, _bytes: usize) {}
@@ -372,6 +434,10 @@ mod udif_stats {
         pub fn job_emitted(&self, _bytes: usize) {}
         pub fn ready(&self, _n: u64) {}
         pub fn lag(&self, _n: u64) {}
+        pub fn init_workers(&self, _n: usize) {}
+        pub fn worker_sent(&self, _index: usize) {}
+        pub fn worker_started(&self, _index: usize) {}
+        pub fn worker_cancelled(&self, _index: usize) {}
         pub fn read_wait(&self, _d: Duration) {}
         pub fn write_out(&self, _d: Duration) {}
         pub fn wait_window(&self, _d: Duration) {}
@@ -1050,10 +1116,11 @@ impl Parallel {
         stats: udif_stats::Stats,
     ) -> Result<Self> {
         let threads = threads.clamp(1, MAX_WRITE_THREADS);
+        stats.init_workers(threads);
         let (tx, rx) = mpsc::channel();
         let mut senders = Vec::with_capacity(threads);
         let mut workers = Vec::with_capacity(threads);
-        for _ in 0..threads {
+        for index in 0..threads {
             let (job_tx, job_rx) = mpsc::channel::<ChunkJob>();
             let tx = tx.clone();
             let stats = stats.clone();
@@ -1061,6 +1128,7 @@ impl Parallel {
                 .name("fstool-udif".into())
                 .spawn(move || {
                     while let Ok(job) = job_rx.recv() {
+                        stats.worker_started(index);
                         stats.job_start();
                         let t = std::time::Instant::now();
                         let result =
@@ -1090,6 +1158,9 @@ impl Parallel {
             workers,
             // Bounded in-flight chunks. Larger windows did not change
             // throughput in testing, so keep the memory bounded.
+            // Bounded in-flight chunks. With the published-progress
+            // counter, deeper windows did not improve completed
+            // throughput; they only buffered producer read-ahead.
             window: (threads * 4).max(2),
             in_flight: 0,
             next_send: 0,
@@ -1522,6 +1593,7 @@ impl<W: Write + Seek> UdifWriter<W> {
             length,
         });
         self.fork_len += length;
+        self.stats.add_published_sectors(count);
         self.pending.clear();
         Ok(())
     }
@@ -1541,10 +1613,13 @@ impl<W: Write + Seek> UdifWriter<W> {
             count,
         }));
         let sender = p.senders[p.next_sender].clone();
+        let worker_index = p.next_sender;
         p.next_sender = (p.next_sender + 1) % p.senders.len();
+        self.stats.worker_sent(worker_index);
         let sent = sender.send(ChunkJob { index, plain });
         self.pending = p.take_buffer();
         if sent.is_err() {
+            self.stats.worker_cancelled(worker_index);
             self.parallel = Some(p);
             return Err(crate::Error::Io(std::io::Error::other(
                 "dmg: compression worker stopped",
@@ -1631,6 +1706,7 @@ impl<W: Write + Seek> UdifWriter<W> {
                         offset: self.fork_len,
                         length: 0,
                     });
+                    self.stats.add_published_sectors(count);
                     p.next_write += 1;
                 }
                 Meta::Data(_) => {
@@ -1664,6 +1740,7 @@ impl<W: Write + Seek> UdifWriter<W> {
                         length,
                     });
                     self.fork_len += length;
+                    self.stats.add_published_sectors(meta.count);
                     p.next_write += 1;
                     p.in_flight -= 1;
                     if let Some(buf) = recycle {
