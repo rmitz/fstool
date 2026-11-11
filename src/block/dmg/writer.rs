@@ -3197,6 +3197,26 @@ mod tests {
     }
 
     #[test]
+    fn zero_run_coalescing_boundary_is_128_sectors() {
+        // The coalescing threshold is inclusive: 127 and 128 sectors fold
+        // into one data chunk; 129 is the first run that keeps its own entry.
+        for (run, expected_chunks) in [(127usize, 1), (128, 1), (129, 3)] {
+            let mut disk = vec![0x31u8; 4 * SECTOR];
+            disk.extend(std::iter::repeat_n(0u8, run * SECTOR));
+            disk.extend(std::iter::repeat_n(0x42u8, 4 * SECTOR));
+            let mut o = opts(UdifFormat::Udzo);
+            o.chunk_sectors = 2048;
+            let (_, s) = roundtrip(&o, &disk);
+            assert_eq!(
+                s.chunk_count, expected_chunks,
+                "zero run of {run} sectors produced {} chunks",
+                s.chunk_count
+            );
+            assert_eq!(s.partition_crc32, Some(crate::crc::crc32(&disk)));
+        }
+    }
+
+    #[test]
     fn long_zero_runs_are_still_elided() {
         // A run over the coalescing threshold keeps its compact `Zero`
         // entry rather than becoming (compressible) data.
