@@ -176,6 +176,14 @@ enum SinkMsg {
 /// encryption and disk writes overlap the main thread's read/scan/compress
 /// pipeline.
 #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+/// Forward-only sink that copies each UDIF write into an owned message for
+/// the encryption writer.
+///
+/// The channel is bounded by **message count**, not bytes: 64 slots, and one
+/// message can be as large as a compressed chunk plus UDIF framing. At the
+/// maximum chunk/thread settings the queued backlog can therefore reach
+/// hundreds of MiB. This is a safety bound, not a memory budget; a byte-based
+/// credit scheme would be needed to make the bound tight.
 struct ChannelSink {
     tx: std::sync::mpsc::SyncSender<SinkMsg>,
     pos: u64,
@@ -471,6 +479,8 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                             chunk_size: enc.chunk_size,
                             ..CreateOptions::default()
                         };
+                        // 64 messages, not 64 chunks of bytes: see
+                        // `ChannelSink` for the actual backlog bound.
                         let (tx, rx) = mpsc::sync_channel::<SinkMsg>(64);
                         std::thread::scope(
                             |scope| -> crate::Result<crate::block::dmg::UdifSummary> {

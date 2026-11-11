@@ -1285,8 +1285,16 @@ impl Drop for Parallel {
 ///
 /// Feed sectors with [`write_sectors`](Self::write_sectors), then call
 /// [`finish`](Self::finish) to emit the plist and trailer and get the
-/// sink back. Memory use is bounded by one chunk of plaintext plus its
-/// encoding, plus 40 bytes per emitted chunk descriptor.
+/// sink back.
+///
+/// Memory is bounded by the in-flight window, not by a single fixed total.
+/// With `T` workers the pool keeps up to `4 × T` data jobs in flight; each
+/// holds up to one chunk of plaintext and, until published, an encoded copy.
+/// Add one pending chunk, an 8 MiB read-ahead buffer, recycled buffers, and
+/// the per-chunk descriptors. At the defaults (3 workers, 1 MiB chunks) this
+/// is tens of MiB; at the supported maximum (16 workers, 8 MiB chunks) it can
+/// exceed 1 GiB. Descriptors (about 40 bytes each) and plist resources grow
+/// with chunk count and image fragmentation, so no single total is fixed.
 ///
 /// Errors from the sink or a codec are returned as they happen; after
 /// one, the writer is poisoned and every later call fails, so a
