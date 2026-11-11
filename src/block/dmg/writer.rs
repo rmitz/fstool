@@ -471,6 +471,7 @@ mod udif_stats {
     #[derive(Clone, Copy)]
     pub struct Stats;
 
+    #[allow(dead_code)]
     impl Stats {
         pub fn from_env() -> Self {
             Self
@@ -1207,6 +1208,7 @@ impl Parallel {
                         while let Ok(job) = job_rx.recv() {
                             worker_stats.worker_started(index);
                             worker_stats.job_start();
+                            #[cfg(feature = "udif-stats")]
                             let t = std::time::Instant::now();
                             let result =
                                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1219,6 +1221,7 @@ impl Parallel {
                                     }),
                                     Err(payload) => Err(worker_panic_error(payload)),
                                 };
+                            #[cfg(feature = "udif-stats")]
                             worker_stats.job_end(t.elapsed().as_nanos() as u64);
                             if tx.send(result).is_err() {
                                 break;
@@ -1453,6 +1456,7 @@ impl<W: Write + Seek> UdifWriter<W> {
     }
 
     /// Handle for the optional `udif-stats` counters.
+    #[cfg(feature = "udif-stats")]
     pub(crate) fn stats_handle(&self) -> udif_stats::Stats {
         clone_stats(&self.stats)
     }
@@ -1673,8 +1677,10 @@ impl<W: Write + Seek> UdifWriter<W> {
             Some((kind, bytes)) if bytes.len() < self.pending.len() => (*kind, bytes),
             _ => (ChunkType::Raw, &self.pending),
         };
+        #[cfg(feature = "udif-stats")]
         let t = std::time::Instant::now();
         self.out.write_all(payload)?;
+        #[cfg(feature = "udif-stats")]
         self.stats.write_out(t.elapsed());
         self.fork_sum.update(payload);
         let length = payload.len() as u64;
@@ -1759,15 +1765,19 @@ impl<W: Write + Seek> UdifWriter<W> {
             }
         }
         while p.in_flight > 0 && (all || p.in_flight >= p.window) {
+            #[cfg(feature = "udif-stats")]
             let t = std::time::Instant::now();
             let res = p.rx.recv().map_err(|_| {
                 crate::Error::Io(std::io::Error::other("dmg: compression worker stopped"))
             })?;
-            let waited = t.elapsed();
-            if all {
-                self.stats.wait_finalize(waited);
-            } else {
-                self.stats.wait_window(waited);
+            #[cfg(feature = "udif-stats")]
+            {
+                let waited = t.elapsed();
+                if all {
+                    self.stats.wait_finalize(waited);
+                } else {
+                    self.stats.wait_window(waited);
+                }
             }
             let done = res?;
             p.ready.insert(done.index, done);
@@ -1817,8 +1827,10 @@ impl<W: Write + Seek> UdifWriter<W> {
                         }
                         _ => (ChunkType::Raw, plain, None),
                     };
+                    #[cfg(feature = "udif-stats")]
                     let t = std::time::Instant::now();
                     self.out.write_all(&payload)?;
+                    #[cfg(feature = "udif-stats")]
                     self.stats.write_out(t.elapsed());
                     self.fork_sum.update(&payload);
                     let length = payload.len() as u64;
@@ -2289,13 +2301,16 @@ pub fn write_udif<W: Write + Seek>(
         }
     }
     let mut w = UdifWriter::new(out, opts)?;
+    #[cfg(feature = "udif-stats")]
     let stats = w.stats_handle();
     let mut buf = vec![0u8; (opts.chunk_sectors as usize * SECTOR).max(READ_AHEAD)];
     let mut off = 0u64;
     while off < total {
         let n = buf.len().min((total - off) as usize);
+        #[cfg(feature = "udif-stats")]
         let t = std::time::Instant::now();
         src.read_at(off, &mut buf[..n])?;
+        #[cfg(feature = "udif-stats")]
         stats.read_wait(t.elapsed());
         w.write_sectors(&buf[..n])?;
         off += n as u64;
@@ -2315,13 +2330,16 @@ pub fn write_udif_from_reader<R: Read, W: Write + Seek>(
 ) -> Result<(W, UdifSummary)> {
     check_length(len)?;
     let mut w = UdifWriter::new(out, opts)?;
+    #[cfg(feature = "udif-stats")]
     let stats = w.stats_handle();
     let mut buf = vec![0u8; (opts.chunk_sectors as usize * SECTOR).max(READ_AHEAD)];
     let mut off = 0u64;
     while off < len {
         let n = buf.len().min((len - off) as usize);
+        #[cfg(feature = "udif-stats")]
         let t = std::time::Instant::now();
         src.read_exact(&mut buf[..n])?;
+        #[cfg(feature = "udif-stats")]
         stats.read_wait(t.elapsed());
         w.write_sectors(&buf[..n])?;
         off += n as u64;
