@@ -91,20 +91,45 @@ use crate::md5::Md5;
 #[cfg(feature = "udif-stats")]
 mod udif_stats {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use super::{MAX_WRITE_THREADS, SECTOR};
 
     const BUCKETS: usize = 40;
 
-    #[derive(Clone)]
     pub struct Stats {
         inner: Option<Arc<Inner>>,
     }
 
+    impl Clone for Stats {
+        fn clone(&self) -> Self {
+            if let Some(inner) = &self.inner {
+                inner.owners.fetch_add(1, Ordering::Relaxed);
+            }
+            Self {
+                inner: self.inner.clone(),
+            }
+        }
+    }
+
+    impl Drop for Stats {
+        fn drop(&mut self) {
+            if let Some(inner) = &self.inner
+                && inner.owners.fetch_sub(1, Ordering::AcqRel) == 1
+            {
+                // Last API handle: stop the reporter even if the writer was
+                // dropped without reaching `finish`.
+                inner.stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     struct Inner {
         start: Instant,
+        /// Number of live `Stats` handles. The reporter thread itself holds
+        /// an `Arc<Inner>`, so it cannot use the strong count for this.
+        owners: AtomicUsize,
         sectors: AtomicU64,
         published: AtomicU64,
         zero_sectors: AtomicU64,
@@ -129,17 +154,24 @@ mod udif_stats {
         hist: [AtomicU64; BUCKETS],
         enc_hist: [AtomicU64; BUCKETS],
         stop: AtomicBool,
+        #[cfg(test)]
+        alive: Arc<AtomicBool>,
     }
 
     impl Stats {
         pub fn from_env() -> Self {
             let enabled =
                 std::env::var_os("FSTOOL_UDIF_STATS").is_some_and(|v| !v.is_empty() && v != "0");
+            Self::start(enabled)
+        }
+
+        fn start(enabled: bool) -> Self {
             if !enabled {
                 return Self { inner: None };
             }
             let inner = Arc::new(Inner {
                 start: Instant::now(),
+                owners: AtomicUsize::new(1),
                 sectors: AtomicU64::new(0),
                 published: AtomicU64::new(0),
                 zero_sectors: AtomicU64::new(0),
@@ -164,6 +196,8 @@ mod udif_stats {
                 hist: std::array::from_fn(|_| AtomicU64::new(0)),
                 enc_hist: std::array::from_fn(|_| AtomicU64::new(0)),
                 stop: AtomicBool::new(false),
+                #[cfg(test)]
+                alive: Arc::new(AtomicBool::new(true)),
             });
             let report = Arc::clone(&inner);
             let _ = std::thread::Builder::new()
@@ -180,8 +214,25 @@ mod udif_stats {
                             print_stats(&report);
                         }
                     }
+                    #[cfg(test)]
+                    report.alive.store(false, Ordering::Relaxed);
                 });
             Self { inner: Some(inner) }
+        }
+
+        /// Start an always-enabled reporter and return a liveness flag the
+        /// test can poll after dropping the handles.
+        #[cfg(test)]
+        pub fn for_test() -> (Self, Arc<AtomicBool>) {
+            let stats = Self::start(true);
+            let alive = Arc::clone(
+                &stats
+                    .inner
+                    .as_ref()
+                    .expect("enabled stats have an inner")
+                    .alive,
+            );
+            (stats, alive)
         }
 
         fn inner(&self) -> Option<&Inner> {
@@ -3008,6 +3059,27 @@ mod tests {
         assert_eq!(sa.chunk_count, sb.chunk_count);
         assert_eq!(sa.data_fork_crc32, sb.data_fork_crc32);
         assert_eq!(sa.master_crc32, sb.master_crc32);
+    }
+
+    #[cfg(feature = "udif-stats")]
+    #[test]
+    fn stats_reporter_stops_when_the_last_handle_drops() {
+        let (stats, alive) = super::udif_stats::Stats::for_test();
+        let clone = clone_stats(&stats);
+        assert!(alive.load(std::sync::atomic::Ordering::Relaxed));
+        drop(stats);
+        assert!(
+            alive.load(std::sync::atomic::Ordering::Relaxed),
+            "a live clone must keep the reporter running"
+        );
+        drop(clone);
+        for _ in 0..100 {
+            if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("stats reporter did not stop after the last handle dropped");
     }
 
     #[test]
