@@ -179,11 +179,23 @@ enum SinkMsg {
 /// Forward-only sink that copies each UDIF write into an owned message for
 /// the encryption writer.
 ///
-/// The channel is bounded by **message count**, not bytes: 64 slots, and one
-/// message can be as large as a compressed chunk plus UDIF framing. At the
-/// maximum chunk/thread settings the queued backlog can therefore reach
-/// hundreds of MiB. This is a safety bound, not a memory budget; a byte-based
-/// credit scheme would be needed to make the bound tight.
+/// The channel is bounded by **message count only**: 64 slots. A message can
+/// be a compressed chunk, but it can also be an entire serialized plist or
+/// resource blob, so there is no fixed byte safety limit and the effective
+/// backlog depends on image size and fragmentation. A byte-based credit
+/// scheme would be needed to make the bound tight.
+#[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+fn thread_panic_error(payload: Box<dyn std::any::Any + Send>) -> crate::Error {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    crate::Error::Io(std::io::Error::other(format!(
+        "dmg: encrypted writer thread panicked: {message}"
+    )))
+}
+
 struct ChannelSink {
     tx: std::sync::mpsc::SyncSender<SinkMsg>,
     pos: u64,
@@ -479,8 +491,8 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                             chunk_size: enc.chunk_size,
                             ..CreateOptions::default()
                         };
-                        // 64 messages, not 64 chunks of bytes: see
-                        // `ChannelSink` for the actual backlog bound.
+                        // 64 messages, not 64 chunks of bytes; a message may
+                        // be the whole plist. See `ChannelSink`.
                         let (tx, rx) = mpsc::sync_channel::<SinkMsg>(64);
                         std::thread::scope(
                             |scope| -> crate::Result<crate::block::dmg::UdifSummary> {
@@ -488,8 +500,28 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                                     .name("fstool-enc".into())
                                     .spawn_scoped(scope, move || -> crate::Result<()> {
                                         #[cfg(test)]
-                                        if enc.passphrase == "__test_panic_writer__" {
-                                            panic!("injected encrypted writer panic");
+                                        match enc.passphrase.as_str() {
+                                            "__test_panic_writer__" => {
+                                                panic!("injected encrypted writer panic")
+                                            }
+                                            "__test_writer_error__" => {
+                                                return Err(crate::Error::Io(
+                                                    std::io::Error::other(
+                                                        "injected encrypted writer error",
+                                                    ),
+                                                ));
+                                            }
+                                            "__test_writer_delay_error__" => {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(100),
+                                                );
+                                                return Err(crate::Error::Io(
+                                                    std::io::Error::other(
+                                                        "injected delayed writer error",
+                                                    ),
+                                                ));
+                                            }
+                                            _ => {}
                                         }
                                         let mut sink = EncryptedDmgSink::new(
                                             f,
@@ -514,6 +546,12 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                                             // for `write_beside` to remove.
                                             return Ok(());
                                         }
+                                        #[cfg(test)]
+                                        if enc.passphrase == "__test_finish_error__" {
+                                            return Err(crate::Error::Io(std::io::Error::other(
+                                                "injected encrypted finish error",
+                                            )));
+                                        }
                                         let (file, _created) = sink.finish(&mut OsRandom)?;
                                         file.sync_all()?;
                                         Ok(())
@@ -536,16 +574,8 @@ pub fn convert_image(src: &Path, dst: &Path, opts: &ConvertOptions) -> Result<Co
                                         drop(sink);
                                         Ok::<_, crate::Error>(summary)
                                     }))
-                                    .unwrap_or_else(|_| {
-                                        Err(crate::Error::Io(std::io::Error::other(
-                                            "dmg: encrypted conversion panicked",
-                                        )))
-                                    });
-                                let writer_result = writer.join().map_err(|_| {
-                                    crate::Error::Io(std::io::Error::other(
-                                        "dmg: encrypted writer thread panicked",
-                                    ))
-                                });
+                                    .unwrap_or_else(|payload| Err(thread_panic_error(payload)));
+                                let writer_result = writer.join().map_err(thread_panic_error);
                                 match (producer, writer_result) {
                                     // The writer's own error is more specific
                                     // than the BrokenPipe the producer saw
@@ -745,32 +775,109 @@ mod security_tests {
         assert_eq!(std::fs::read(dst).unwrap(), data);
     }
 
-    #[test]
     #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
-    fn encrypted_writer_panic_returns_error_without_hanging() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("source.raw");
-        std::fs::write(&src, vec![0x42; 1024]).unwrap();
-        let dst = dir.path().join("encrypted.dmg");
-        let opts = ConvertOptions {
+    fn encrypted_opts(passphrase: &'static str) -> ConvertOptions {
+        ConvertOptions {
             dmg_encryption: Some(DmgEncryption::new(
                 crate::block::dmg::encrypted::ContentCipher::Aes256,
-                "__test_panic_writer__",
+                passphrase,
             )),
             ..ConvertOptions::default()
-        };
+        }
+    }
+
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn run_encrypted(
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        opts: ConvertOptions,
+    ) -> String {
         let (tx, rx) = std::sync::mpsc::channel();
         let thread_dst = dst.clone();
         let h = std::thread::spawn(move || {
             let result = convert_image(&src, &thread_dst, &opts);
-            tx.send(result.is_err()).unwrap();
+            tx.send(result.err().map(|e| e.to_string())).unwrap();
         });
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_secs(10))
-                .expect("encrypted writer panic left conversion blocked"),
-            "encrypted writer panic should surface as an error"
-        );
+        let error = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("encrypted conversion left the test blocked");
         h.join().unwrap();
+        error.expect("conversion should have failed")
+    }
+
+    #[test]
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn encrypted_writer_panic_returns_expected_error_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.raw");
+        std::fs::write(&src, vec![0x42; 1024]).unwrap();
+        let dst = dir.path().join("encrypted.dmg");
+        let error = run_encrypted(src, dst.clone(), encrypted_opts("__test_panic_writer__"));
+        assert!(
+            error.contains("encrypted writer thread panicked"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("injected encrypted writer panic"));
+        assert!(
+            !dst.exists(),
+            "failed conversion must not publish a destination"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn encrypted_writer_error_keeps_its_cause_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.raw");
+        std::fs::write(&src, vec![0x42; 1024]).unwrap();
+        let dst = dir.path().join("encrypted.dmg");
+        std::fs::write(&dst, b"keep existing").unwrap();
+        let error = run_encrypted(src, dst.clone(), encrypted_opts("__test_writer_error__"));
+        assert!(
+            error.contains("injected encrypted writer error"),
+            "writer error was replaced: {error}"
+        );
+        assert!(!error.contains("BrokenPipe"), "BrokenPipe won: {error}");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"keep existing");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "temporary sibling was left behind"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn encrypted_writer_error_while_producer_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.raw");
+        std::fs::write(&src, vec![0x42; 1024 * 1024]).unwrap();
+        let dst = dir.path().join("encrypted.dmg");
+        let mut opts = encrypted_opts("__test_writer_delay_error__");
+        opts.udif.chunk_sectors = 1;
+        let error = run_encrypted(src, dst.clone(), opts);
+        assert!(
+            error.contains("injected delayed writer error"),
+            "blocked producer saw the wrong error: {error}"
+        );
+        assert!(
+            !dst.exists(),
+            "failed conversion must not publish a destination"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "dmg-write", feature = "dmg-encrypted-write"))]
+    fn encrypted_writer_error_during_finalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.raw");
+        std::fs::write(&src, vec![0x42; 1024]).unwrap();
+        let dst = dir.path().join("encrypted.dmg");
+        let error = run_encrypted(src, dst.clone(), encrypted_opts("__test_finish_error__"));
+        assert!(
+            error.contains("injected encrypted finish error"),
+            "finish error was lost: {error}"
+        );
         assert!(
             !dst.exists(),
             "failed conversion must not publish a destination"

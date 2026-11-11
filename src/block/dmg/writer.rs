@@ -98,6 +98,13 @@ mod udif_stats {
 
     const BUCKETS: usize = 40;
 
+    #[cfg(test)]
+    static LIVE_REPORTERS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(test)]
+    thread_local! {
+        static FORCE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     pub struct Stats {
         inner: Option<Arc<Inner>>,
     }
@@ -160,9 +167,23 @@ mod udif_stats {
 
     impl Stats {
         pub fn from_env() -> Self {
-            let enabled =
-                std::env::var_os("FSTOOL_UDIF_STATS").is_some_and(|v| !v.is_empty() && v != "0");
+            #[cfg(test)]
+            let forced = FORCE_FOR_TEST.with(|f| f.get());
+            #[cfg(not(test))]
+            let forced = false;
+            let enabled = forced
+                || std::env::var_os("FSTOOL_UDIF_STATS").is_some_and(|v| !v.is_empty() && v != "0");
             Self::start(enabled)
+        }
+
+        #[cfg(test)]
+        pub fn force_for_test(on: bool) {
+            FORCE_FOR_TEST.with(|f| f.set(on));
+        }
+
+        #[cfg(test)]
+        pub fn live_reporters() -> usize {
+            LIVE_REPORTERS.load(Ordering::Relaxed)
         }
 
         fn start(enabled: bool) -> Self {
@@ -199,6 +220,8 @@ mod udif_stats {
                 #[cfg(test)]
                 alive: Arc::new(AtomicBool::new(true)),
             });
+            #[cfg(test)]
+            LIVE_REPORTERS.fetch_add(1, Ordering::Relaxed);
             let report = Arc::clone(&inner);
             let _ = std::thread::Builder::new()
                 .name("fstool-udif-stats".into())
@@ -215,7 +238,10 @@ mod udif_stats {
                         }
                     }
                     #[cfg(test)]
-                    report.alive.store(false, Ordering::Relaxed);
+                    {
+                        report.alive.store(false, Ordering::Relaxed);
+                        LIVE_REPORTERS.fetch_sub(1, Ordering::Relaxed);
+                    }
                 });
             Self { inner: Some(inner) }
         }
@@ -1294,10 +1320,11 @@ impl Drop for Parallel {
 /// With `T` workers the pool keeps up to `4 × T` data jobs in flight; each
 /// holds up to one chunk of plaintext and, until published, an encoded copy.
 /// Add one pending chunk, an 8 MiB read-ahead buffer, recycled buffers, and
-/// the per-chunk descriptors. At the defaults (3 workers, 1 MiB chunks) this
-/// is tens of MiB; at the supported maximum (16 workers, 8 MiB chunks) it can
-/// exceed 1 GiB. Descriptors (about 40 bytes each) and plist resources grow
-/// with chunk count and image fragmentation, so no single total is fixed.
+/// the per-chunk descriptors. The library default is one worker, so a
+/// sequential write holds one chunk. A three-worker deployment with 1 MiB
+/// chunks is tens of MiB; at the supported maximum (16 workers, 8 MiB chunks)
+/// it can exceed 1 GiB. Descriptors (about 40 bytes each) and plist resources
+/// grow with chunk count and image fragmentation, so no single total is fixed.
 ///
 /// Errors from the sink or a codec are returned as they happen; after
 /// one, the writer is poisoned and every later call fails, so a
@@ -3088,8 +3115,66 @@ mod tests {
     }
 
     #[cfg(feature = "udif-stats")]
+    static STATS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "udif-stats")]
+    fn wait_for_reporters(baseline: usize) {
+        for _ in 0..100 {
+            if super::udif_stats::Stats::live_reporters() <= baseline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("stats reporter did not stop");
+    }
+
+    #[cfg(feature = "udif-stats")]
+    struct FailSink;
+
+    #[cfg(feature = "udif-stats")]
+    impl std::io::Write for FailSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected sink error"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "udif-stats")]
+    impl std::io::Seek for FailSink {
+        fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[cfg(feature = "udif-stats")]
+    #[test]
+    fn stats_reporter_stops_after_writer_drop_and_error() {
+        let _guard = STATS_TEST_LOCK.lock().unwrap();
+        let baseline = super::udif_stats::Stats::live_reporters();
+        let mut o = opts(UdifFormat::Udzo);
+        o.threads = 1;
+        super::udif_stats::Stats::force_for_test(true);
+        let mut w = UdifWriter::new(Cursor::new(Vec::new()), &o).unwrap();
+        w.write_sectors(&[1u8; SECTOR]).unwrap();
+        drop(w);
+        super::udif_stats::Stats::force_for_test(false);
+        wait_for_reporters(baseline);
+
+        let baseline = super::udif_stats::Stats::live_reporters();
+        super::udif_stats::Stats::force_for_test(true);
+        let mut w = UdifWriter::new(FailSink, &o).unwrap();
+        w.write_sectors(&[1u8; SECTOR]).unwrap();
+        assert!(w.finish().is_err());
+        super::udif_stats::Stats::force_for_test(false);
+        wait_for_reporters(baseline);
+    }
+
+    #[cfg(feature = "udif-stats")]
     #[test]
     fn stats_reporter_stops_when_the_last_handle_drops() {
+        let _guard = STATS_TEST_LOCK.lock().unwrap();
         let (stats, alive) = super::udif_stats::Stats::for_test();
         let clone = clone_stats(&stats);
         assert!(alive.load(std::sync::atomic::Ordering::Relaxed));
@@ -3120,13 +3205,17 @@ mod tests {
             let mut dev = crate::block::MemoryBackend::new(disk.len() as u64);
             dev.write_at(0, &disk).unwrap();
             let r = write_udif(&mut dev, Cursor::new(Vec::new()), &o);
-            tx.send(r.is_err()).unwrap();
+            tx.send(r.err().map(|e| e.to_string())).unwrap();
         });
+        let error = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker panic left the writer blocked")
+            .expect("worker panic should surface as an error");
         assert!(
-            rx.recv_timeout(std::time::Duration::from_secs(10))
-                .expect("worker panic left the writer blocked"),
-            "worker panic should surface as an error"
+            error.contains("compression worker panicked"),
+            "unexpected error: {error}"
         );
+        assert!(error.contains("injected compression worker panic"));
         h.join().unwrap();
     }
 
