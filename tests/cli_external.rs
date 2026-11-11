@@ -2703,3 +2703,45 @@ fn cli_create_hfsplus_from_tar_source() {
     let listing = String::from_utf8_lossy(&out.stdout);
     assert!(listing.contains("hello.txt"), "listing: {listing}");
 }
+
+/// A non-UTF-8 source *directory name* must not be forced through `to_str`.
+#[cfg(all(unix, feature = "hfs-plus"))]
+#[test]
+fn cli_create_accepts_non_utf8_directory_source() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let name = OsString::from_vec(b"source-\xFF".to_vec());
+    let src = work.path().join(name);
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("hello.txt"), b"hello\n").unwrap();
+
+    let img = work.path().join("out.img");
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "hfsplus", "--size", "32MiB"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create from non-UTF-8 directory failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(img.exists(), "create did not produce an image");
+
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(&img)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hello.txt"),
+        "listing: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

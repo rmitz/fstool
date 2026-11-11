@@ -3823,6 +3823,12 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
     let source = args
         .src_dir
         .map(|p| {
+            // Directories are the common case and can be handed over as a
+            // Path without round-tripping through UTF-8; only archive/image
+            // detection needs a string spec.
+            if p.is_dir() {
+                return Ok(fstool::repack::Source::HostDir(p.to_path_buf()));
+            }
             let s = p.to_str().ok_or_else(|| {
                 fstool::Error::InvalidArgument(format!(
                     "create: source path {p:?} is not valid UTF-8"
