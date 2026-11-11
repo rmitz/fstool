@@ -1087,6 +1087,18 @@ enum Meta {
     },
 }
 
+/// Turn a caught worker panic into an error the coordinator can propagate.
+fn worker_panic_error(payload: Box<dyn std::any::Any + Send>) -> crate::Error {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    crate::Error::Io(std::io::Error::other(format!(
+        "dmg: compression worker panicked: {message}"
+    )))
+}
+
 /// Clone a stats handle. The no-op stats type is `Copy`, while the
 /// `udif-stats` build's handle owns an `Arc`; this keeps both builds happy
 /// without a feature-dependent `clone_on_copy` lint.
@@ -1131,24 +1143,39 @@ impl Parallel {
         for index in 0..threads {
             let (job_tx, job_rx) = mpsc::channel::<ChunkJob>();
             let tx = tx.clone();
+            // A separate sender survives the catch_unwind so a panicking
+            // worker always reports a result: without it the coordinator can
+            // block in `rx.recv` forever while the surviving workers hold
+            // their own result senders open.
+            let fail_tx = tx.clone();
             let worker_stats = clone_stats(&stats);
             let worker = std::thread::Builder::new()
                 .name("fstool-udif".into())
                 .spawn(move || {
-                    while let Ok(job) = job_rx.recv() {
-                        worker_stats.worker_started(index);
-                        worker_stats.job_start();
-                        let t = std::time::Instant::now();
-                        let result =
-                            encode_chunk(format, level, &job.plain).map(|encoded| ChunkDone {
-                                index: job.index,
-                                encoded,
-                                plain: job.plain,
-                            });
-                        worker_stats.job_end(t.elapsed().as_nanos() as u64);
-                        if tx.send(result).is_err() {
-                            break;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        while let Ok(job) = job_rx.recv() {
+                            worker_stats.worker_started(index);
+                            worker_stats.job_start();
+                            let t = std::time::Instant::now();
+                            let result =
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    encode_chunk(format, level, &job.plain)
+                                })) {
+                                    Ok(result) => result.map(|encoded| ChunkDone {
+                                        index: job.index,
+                                        encoded,
+                                        plain: job.plain,
+                                    }),
+                                    Err(payload) => Err(worker_panic_error(payload)),
+                                };
+                            worker_stats.job_end(t.elapsed().as_nanos() as u64);
+                            if tx.send(result).is_err() {
+                                break;
+                            }
                         }
+                    }));
+                    if let Err(payload) = outcome {
+                        let _ = fail_tx.send(Err(worker_panic_error(payload)));
                     }
                 })
                 .map_err(|e| {
@@ -1975,6 +2002,11 @@ fn encode_chunk(
         feature = "dmg-write-lzma"
     )))]
     let _ = level;
+    // Deterministic panic injection for the worker-failure test.
+    #[cfg(test)]
+    if plain.starts_with(b"fstool-worker-panic") {
+        panic!("injected compression worker panic");
+    }
     Ok(match format {
         UdifFormat::Udro | UdifFormat::Ufbi => None,
         UdifFormat::Udco => Some((ChunkType::Adc, super::codec::encode_adc(plain))),
@@ -2976,6 +3008,28 @@ mod tests {
         assert_eq!(sa.chunk_count, sb.chunk_count);
         assert_eq!(sa.data_fork_crc32, sb.data_fork_crc32);
         assert_eq!(sa.master_crc32, sb.master_crc32);
+    }
+
+    #[test]
+    fn worker_panic_returns_error_instead_of_hanging() {
+        let mut disk = vec![0x5Au8; 2 * SECTOR];
+        let marker = b"fstool-worker-panic";
+        disk[..marker.len()].copy_from_slice(marker);
+        let mut o = opts(UdifFormat::Udzo);
+        o.threads = 3;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let mut dev = crate::block::MemoryBackend::new(disk.len() as u64);
+            dev.write_at(0, &disk).unwrap();
+            let r = write_udif(&mut dev, Cursor::new(Vec::new()), &o);
+            tx.send(r.is_err()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("worker panic left the writer blocked"),
+            "worker panic should surface as an error"
+        );
+        h.join().unwrap();
     }
 
     #[test]
