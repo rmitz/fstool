@@ -545,6 +545,8 @@ const KOLY_IMAGE_VARIANT_PARTITIONED: u32 = 1;
 const BLKX_DESCRIPTOR_WHOLE_DISK: i32 = -2;
 /// Default chunk span: 2048 sectors (1 MiB), `hdiutil`'s own.
 const DEFAULT_CHUNK_SECTORS: u32 = 2048;
+/// Deployment-only default: level 4 for UDZO on the fast integration build.
+const DEFAULT_UDZO_LEVEL: u8 = 4;
 /// Upper bound on [`UdifWriteOptions::chunk_sectors`]. Bounds the
 /// writer's per-chunk buffers (8 MiB of plaintext) while staying far below
 /// the reader's own cap.
@@ -2110,18 +2112,17 @@ fn encode_chunk(
         UdifFormat::Udco => Some((ChunkType::Adc, super::codec::encode_adc(plain))),
         #[cfg(feature = "dmg-write-zlib")]
         UdifFormat::Udzo => {
+            let level = level.unwrap_or(DEFAULT_UDZO_LEVEL).min(9);
             #[cfg(feature = "dmg-write-zlib-sirocco")]
             let encoded = sirocco::compress(
                 sirocco::Format::Zlib,
-                sirocco::deflate::Level::new(level.unwrap_or(6).min(9)),
+                sirocco::deflate::Level::new(level),
                 plain,
             );
             #[cfg(not(feature = "dmg-write-zlib-sirocco"))]
             let encoded = {
                 let mut cfg = compcol::zlib::EncoderConfig::default();
-                if let Some(l) = level {
-                    cfg.level = l;
-                }
+                cfg.level = level;
                 cc_encode::<compcol::zlib::Zlib>(plain, cfg)?
             };
             Some((ChunkType::Zlib, encoded))

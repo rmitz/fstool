@@ -131,7 +131,7 @@ alloc = []
 #
 # which drops `clap` and `rustyline` (and their ~30 transitive crates)
 # while keeping every format.
-codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-write-zlib", "dmg-write-bzip2", "dmg-write-lzma", "dmg-write-lzfse"]
+codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-write-zlib", "dmg-write-zlib-sirocco", "dmg-write-bzip2", "dmg-write-lzma", "dmg-write-lzfse"]
 
 # ---------------------------------------------------------------------
 # Filesystems. One feature per backend, every one on by default through
