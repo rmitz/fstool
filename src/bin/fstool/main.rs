@@ -424,8 +424,7 @@ enum Command {
         #[arg(long, value_name = "FORMAT")]
         dmg_format: Option<String>,
         /// Compression level for a UDIF destination (zlib / bzip2 1-9,
-        /// LZMA 0-9). Defaults to 4 for UDZO and to the codec's own default
-        /// otherwise.
+        /// LZMA 0-9). Defaults to the codec's own default.
         #[cfg(feature = "dmg-write")]
         #[arg(long, value_name = "N")]
         dmg_level: Option<u8>,

@@ -9,8 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(dmg)* pure-Rust `sirocco` encoder for UDZO (`dmg-write-zlib-sirocco`), roughly 3x faster than `compcol` on the 1 MiB chunks a UDIF image uses; enabled through the default `codecs` feature
-- *(dmg)* UDZO now defaults to zlib level 4, the speed/ratio knee for independent 1 MiB chunks
+- *(dmg)* optional pure-Rust `sirocco` encoder for UDZO (`dmg-write-zlib-sirocco`), faster than `compcol` on the 1 MiB chunks a UDIF image uses; opt-in, `codecs` keeps compcol
 
 ## [0.5.3](https://github.com/KarpelesLab/fstool/compare/v0.5.2...v0.5.3) - 2026-11-09
 

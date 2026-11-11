@@ -131,7 +131,7 @@ alloc = []
 #
 # which drops `clap` and `rustyline` (and their ~30 transitive crates)
 # while keeping every format.
-codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-write-zlib", "dmg-write-zlib-sirocco", "dmg-write-bzip2", "dmg-write-lzma", "dmg-write-lzfse"]
+codecs = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "bzip2", "deflate64", "zip-legacy", "zip-aes", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-write-zlib", "dmg-write-bzip2", "dmg-write-lzma", "dmg-write-lzfse"]
 
 # ---------------------------------------------------------------------
 # Filesystems. One feature per backend, every one on by default through
@@ -403,7 +403,7 @@ dmg-write = ["dmg"]
 dmg-write-zlib = ["dmg-write", "gzip"]
 # Use the pure-Rust sirocco encoder for UDZO instead of compcol. Decoding
 # stays on compcol, so the output is ordinary zlib and either build can read
-# it. UDZO defaults to level 4 with this feature (see `DEFAULT_UDZO_LEVEL`).
+# it. Opt-in: `codecs` keeps compcol as the default encoder.
 dmg-write-zlib-sirocco = ["dmg-write-zlib", "dep:sirocco"]
 dmg-write-bzip2 = ["dmg-write", "dmg-bzip2"]
 dmg-write-lzma = ["dmg-write", "xz"]
